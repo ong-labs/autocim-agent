@@ -30,10 +30,24 @@ show a researcher which published number backs a candidate's energy
 figure, not just an opaque multiplier. Empty for any `hw_spec_id` that
 stayed uncalibrated (factor 1.0), same honesty rule as
 `calibration_factors` itself.
+
+`target_accuracy`/`target_energy_pj`/`target_latency_ms` are optional,
+run-wide multi-objective goals (nodes/evaluator.py: a candidate must meet
+every *configured* one, in addition to @verifier's own IR-drop/noise
+feasibility check, to count as converged) -- plain fields set once at
+session start (main.py's CLI flags), not reduced, since they don't change
+mid-run. `None` (the default) means that dimension isn't gated at all,
+preserving prior behavior for any run that doesn't set them: before these
+fields existed, @verifier's IR-drop/noise check was the *only* convergence
+criterion, so a candidate with unacceptably low accuracy could still end
+a run early -- these fields are the fix for that gap, not a new feature
+invented speculatively (Research_Plan.md's own evaluator_node sketch names
+"Target 지표 미달성" as a failure reason, implying an accuracy/energy/latency
+target was always part of the intended design, just never implemented).
 """
 
 import operator
-from typing import Annotated, Any, Dict, List, TypedDict
+from typing import Annotated, Any, Dict, List, Optional, TypedDict
 
 
 def merge_dicts(left: Dict[str, Any], right: Dict[str, Any]) -> Dict[str, Any]:
@@ -79,6 +93,9 @@ class AutoCIMState(TypedDict):
     planned_layer_configs: List[Dict[str, Any]]
     model_id: str
     hw_spec_id: str
+    target_accuracy: Optional[float]
+    target_energy_pj: Optional[float]
+    target_latency_ms: Optional[float]
     iteration_count: int
     retry_count: int
     is_converged: bool
