@@ -239,7 +239,7 @@ def stub_tuner_qat_backend(monkeypatch: pytest.MonkeyPatch, fake_qat_backend: QA
 @pytest.fixture(autouse=True)
 def stub_planner_layer_groups(monkeypatch: pytest.MonkeyPatch) -> None:
     """Every test gets @planner's view of "real" layer stages stubbed to
-    FAKE_LAYER_GROUPS -- without this, `nodes.planner._real_stage_names`
+    FAKE_LAYER_GROUPS -- without this, `nodes.planner.real_stage_names`
     would call the real `tools.qat.get_layer_groups`, which builds the real
     resnet18 (a checkpoint download) just to read its module names."""
     monkeypatch.setattr(planner_module, "get_layer_groups", lambda model_id: dict(FAKE_LAYER_GROUPS))
