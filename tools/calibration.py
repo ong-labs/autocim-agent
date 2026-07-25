@@ -26,7 +26,7 @@ getting a questionable correction.
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from schemas.calibration import CalibrationReference
 from schemas.config import HWConfig
@@ -64,7 +64,13 @@ KNOWN_REFERENCES: List[CalibrationReference] = [
 ]
 
 
-def _find_matching_reference(hw: HWConfig) -> Optional[CalibrationReference]:
+def find_matching_reference(hw: HWConfig) -> Optional[CalibrationReference]:
+    """Public so callers besides `bootstrap_calibration_factors` (e.g.
+    `tools/dashboard.py`, indirectly via `describe_calibration`) can learn
+    *which* reference calibrated a given `HWConfig`, not just the resulting
+    factor -- an opaque multiplier alone doesn't tell a researcher whether
+    to trust it, or which paper's stated caveats (`CalibrationReference.note`)
+    apply to it."""
     for reference in KNOWN_REFERENCES:
         if (
             reference.crossbar_rows == hw.crossbar_rows
@@ -99,7 +105,37 @@ def bootstrap_calibration_factors(hw: HWConfig) -> Dict[str, float]:
     default (stays uncalibrated) rather than guessing. Otherwise
     `{hw.hw_spec_id: factor}`, ready to seed
     `AutoCIMState.calibration_factors` (main.py's `build_initial_state`)."""
-    reference = _find_matching_reference(hw)
+    reference = find_matching_reference(hw)
     if reference is None:
         return {}
     return {hw.hw_spec_id: compute_calibration_factor(hw, reference)}
+
+
+def describe_calibration(hw: HWConfig) -> Optional[Dict[str, Any]]:
+    """The matching reference's citation/uncertainty, as a plain dict --
+    `None` if `hw` is uncalibrated. Kept separate from
+    `bootstrap_calibration_factors` (rather than folding this into that
+    function's return value) so `AutoCIMState.calibration_factors` stays
+    the simple `{hw_spec_id: float}` shape `tools/simulators.py`'s
+    `profiler_tool` already multiplies by -- this is purely additive
+    metadata for `tools/dashboard.py` to display, not part of the
+    correction math."""
+    reference = find_matching_reference(hw)
+    if reference is None:
+        return None
+    return {
+        "reference_energy_pj_per_mac": reference.reference_energy_pj_per_mac,
+        "source": reference.source,
+        "note": reference.note,
+    }
+
+
+def bootstrap_calibration_provenance(hw: HWConfig) -> Dict[str, Dict[str, Any]]:
+    """`{}` if uncalibrated, else `{hw.hw_spec_id: describe_calibration(hw)}`
+    -- the provenance analogue of `bootstrap_calibration_factors`, seeded
+    into `AutoCIMState.calibration_provenance` by the same caller
+    (main.py's `build_initial_state`)."""
+    described = describe_calibration(hw)
+    if described is None:
+        return {}
+    return {hw.hw_spec_id: described}

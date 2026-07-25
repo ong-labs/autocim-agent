@@ -6,7 +6,14 @@ match a known reference.
 
 from schemas.config import HWConfig, NoCTopology
 from schemas.tools import LayerBitConfig
-from tools.calibration import KNOWN_REFERENCES, bootstrap_calibration_factors, compute_calibration_factor
+from tools.calibration import (
+    KNOWN_REFERENCES,
+    bootstrap_calibration_factors,
+    bootstrap_calibration_provenance,
+    compute_calibration_factor,
+    describe_calibration,
+    find_matching_reference,
+)
 from tools.cim_physics import simulate_cim_profile
 
 _REFERENCE = KNOWN_REFERENCES[0]  # the NeuroSim V1.5 128x128/7-bit-ADC point
@@ -66,3 +73,39 @@ def test_known_reference_has_a_real_citation():
     # invented," so an uncited entry would be a regression of that premise.
     for reference in KNOWN_REFERENCES:
         assert reference.source.strip()
+
+
+# --- Calibration provenance (which reference, and its stated uncertainty) --
+
+
+def test_find_matching_reference_returns_the_exact_match():
+    assert find_matching_reference(_hw()) is _REFERENCE
+
+
+def test_find_matching_reference_is_none_when_nothing_matches():
+    assert find_matching_reference(_hw(adc_bits=_REFERENCE.adc_bits + 1)) is None
+
+
+def test_describe_calibration_surfaces_source_and_note_for_a_calibrated_hw():
+    described = describe_calibration(_hw())
+    assert described["source"] == _REFERENCE.source
+    assert described["note"] == _REFERENCE.note
+    assert described["reference_energy_pj_per_mac"] == _REFERENCE.reference_energy_pj_per_mac
+
+
+def test_describe_calibration_is_none_for_an_uncalibrated_hw():
+    assert describe_calibration(_hw(crossbar_rows=64)) is None
+
+
+def test_bootstrap_calibration_provenance_matches_bootstrap_calibration_factors_keys():
+    """Both bootstrap_* functions must agree on which hw_spec_ids get
+    populated -- a factor with no matching provenance (or vice versa) would
+    let tools/dashboard.py show a number with no traceable source, or a
+    citation for a candidate whose energy wasn't actually corrected by it."""
+    hw = _hw()
+    assert set(bootstrap_calibration_provenance(hw).keys()) == set(bootstrap_calibration_factors(hw).keys())
+    assert bootstrap_calibration_provenance(hw) == {hw.hw_spec_id: describe_calibration(hw)}
+
+
+def test_bootstrap_calibration_provenance_is_empty_when_uncalibrated():
+    assert bootstrap_calibration_provenance(_hw(crossbar_rows=64)) == {}

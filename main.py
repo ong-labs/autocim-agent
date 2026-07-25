@@ -29,7 +29,7 @@ from graph import build_graph
 from middleware import register_hw_config
 from schemas.config import HWConfig, NoCTopology
 from state import AutoCIMState
-from tools.calibration import bootstrap_calibration_factors
+from tools.calibration import bootstrap_calibration_factors, bootstrap_calibration_provenance
 from tools.dashboard import render_dashboard_html
 
 # Sample hardware spec, used when --hw-config isn't given. A real deployment
@@ -115,6 +115,10 @@ def build_initial_state(model_id: str, hw_config: HWConfig) -> AutoCIMState:
         # NeuroSim-validated 128x128/7-bit-ADC config); otherwise {} --
         # @profiler stays uncalibrated (factor 1.0) rather than guessing.
         "calibration_factors": bootstrap_calibration_factors(hw_config),
+        # The citation/uncertainty behind that factor (or {} if
+        # uncalibrated) -- tools/dashboard.py surfaces this so a researcher
+        # sees *which* published number backs a candidate's energy figure.
+        "calibration_provenance": bootstrap_calibration_provenance(hw_config),
         "human_overrides": {},
         "planned_layer_configs": [],
         "model_id": model_id,

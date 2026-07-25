@@ -37,11 +37,14 @@ Scope, stated plainly (CPU-only, no GPU in this environment):
   first-cut multi-architecture coverage) -- `tools/cim_physics.py`'s
   mapper/profiler modeling depthwise vs. dense MACs differently would be a
   real follow-up, not attempted here.
-- Fine-tuning/eval still run on a fixed CIFAR10 subset (not the full 50k/10k
-  images), so a QAT trial completes in CPU time -- an explicit, approved
-  scope decision, not a hidden shortcut. `_TRAIN_SIZE`/`_VAL_SIZE`/`_TEST_SIZE`
-  are a genuine three-way split (see `QATBackend`'s docstring): training and
-  early-stopping never touch the 1000-image test set that `run_qat_tuning`
+- Fine-tuning/eval default to a fixed CIFAR10 subset (not the full 50k/10k
+  images), so a QAT trial completes in CPU time by default -- an explicit,
+  approved scope decision, not a hidden shortcut, and one a deployment can
+  widen (up to the full split) via `AUTOCIM_QAT_TRAIN_SIZE`/`_VAL_SIZE`/
+  `_TEST_SIZE`/`_BATCH_SIZE` without a code change (CLAUDE.md 5.C). Whatever
+  the configured sizes, `_DEFAULT_TRAIN_SIZE`/`_VAL_SIZE`/`_TEST_SIZE` are a
+  genuine three-way split (see `QATBackend`'s docstring): training and
+  early-stopping never touch the test set that `run_qat_tuning`
   reports accuracy on, so that number isn't leaked into the decisions that
   produced it. Still a subset, not the full benchmark -- comparing candidate
   configs against each other is sound; treating the absolute number as a
@@ -65,6 +68,7 @@ a dataset/checkpoint or trains on real data.
 from __future__ import annotations
 
 import copy
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
@@ -337,21 +341,95 @@ def get_layer_groups(model_id: str) -> Dict[str, List[str]]:
 # which cuts the accuracy figure's binomial-proportion 95% CI from roughly
 # +/-8pp down to roughly +/-3pp -- the earlier size was too small to treat
 # as more than a rough directional signal between candidates.
-_TRAIN_SIZE = 512
-_VAL_SIZE = 128
-_TEST_SIZE = 1000
-_BATCH_SIZE = 32
-_DATASET_SEED = 0
+#
+# These were hardcoded module constants (CLAUDE.md 5.C: config-driven, not
+# hardcoded) -- a deployment validating against its *real* target dataset
+# rather than this demo subset had no way to widen scope without editing
+# this file. Now env-var overridable (same pattern as llm.py's
+# AUTOCIM_LLM_* / AUTOCIM_PLANNER_MODEL), defaulting to the values above so
+# nothing changes for a caller that doesn't opt in. `_FULL_SPLIT` lets
+# AUTOCIM_QAT_TRAIN_SIZE/AUTOCIM_QAT_TEST_SIZE request "every image CIFAR10's
+# own split has" without hand-computing 50000/10000 -- resolved against the
+# actual loaded dataset length in `_build_cifar10_loaders`, not guessed here.
+# Widening these multiplies real per-trial wall-clock (CPU-only, no GPU --
+# see this module's docstring); that tradeoff is the caller's to make, not
+# silently defaulted for them.
+_TRAIN_SIZE_ENV = "AUTOCIM_QAT_TRAIN_SIZE"
+_VAL_SIZE_ENV = "AUTOCIM_QAT_VAL_SIZE"
+_TEST_SIZE_ENV = "AUTOCIM_QAT_TEST_SIZE"
+_BATCH_SIZE_ENV = "AUTOCIM_QAT_BATCH_SIZE"
+_SEED_ENV = "AUTOCIM_QAT_SEED"
+
+_DEFAULT_TRAIN_SIZE = 512
+_DEFAULT_VAL_SIZE = 128
+_DEFAULT_TEST_SIZE = 1000
+_DEFAULT_BATCH_SIZE = 32
+_DEFAULT_DATASET_SEED = 0
+
+_FULL_SPLIT = "full"
+
+
+def _resolve_size_env(env_var: str, default: int, *, allow_full: bool) -> int | str:
+    raw = os.environ.get(env_var)
+    if not raw:
+        return default
+    if allow_full and raw.strip().lower() == _FULL_SPLIT:
+        return _FULL_SPLIT
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def _resolve_int_env(env_var: str, default: int) -> int:
+    raw = os.environ.get(env_var)
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def _resolve_split_sizes(
+    train_size: int | str, val_size: int, test_size: int | str, train_available: int, test_available: int
+) -> Tuple[int, int]:
+    """Resolves `_FULL_SPLIT` sentinels against the actual split sizes and
+    validates the result fits -- pulled out of `_build_cifar10_loaders` so
+    it's unit-testable without a real CIFAR10 download (`train_available`/
+    `test_available` are just plain ints here, not `len(some_dataset)`).
+    Raises `ValueError` (not a silent clamp) on a misconfigured explicit
+    size -- a silently truncated split would produce a real but misleading
+    accuracy number rather than a loud, immediate failure."""
+    resolved_train_size = train_available - val_size if train_size == _FULL_SPLIT else train_size
+    resolved_test_size = test_available if test_size == _FULL_SPLIT else test_size
+
+    if resolved_train_size + val_size > train_available:
+        raise ValueError(
+            f"{_TRAIN_SIZE_ENV} ({resolved_train_size}) + {_VAL_SIZE_ENV} ({val_size}) exceeds CIFAR10's "
+            f"{train_available}-image train split -- reduce one of them or set {_TRAIN_SIZE_ENV}={_FULL_SPLIT!r}."
+        )
+    if resolved_test_size > test_available:
+        raise ValueError(
+            f"{_TEST_SIZE_ENV} ({resolved_test_size}) exceeds CIFAR10's {test_available}-image test split."
+        )
+    return resolved_train_size, resolved_test_size
 
 
 def _build_cifar10_loaders(
-    train_size: int, val_size: int, test_size: int, batch_size: int, seed: int
+    train_size: int | str, val_size: int, test_size: int | str, batch_size: int, seed: int
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """Three *disjoint* loaders: `train`/`val` are non-overlapping slices of
     CIFAR10's own 50k-image train split (so validation-set early stopping
     never sees a training example), and `test` is CIFAR10's separate
     10k-image test split, entirely untouched until the one final-accuracy
-    call in `run_qat_tuning`."""
+    call in `run_qat_tuning`. `train_size`/`test_size` may be the literal
+    string `"full"` (`_FULL_SPLIT`) to use every image in that split;
+    `train_size="full"` reserves `val_size` images for validation first and
+    uses the remainder for training, since both can't literally claim the
+    whole 50k-image train split at once."""
     import torchvision.transforms as T
     from torch.utils.data import Subset
     from torchvision.datasets import CIFAR10
@@ -368,11 +446,15 @@ def _build_cifar10_loaders(
     train_full = CIFAR10(root=str(_CACHE_ROOT / "cifar10"), train=True, download=True, transform=transform)
     test_full = CIFAR10(root=str(_CACHE_ROOT / "cifar10"), train=False, download=True, transform=transform)
 
+    resolved_train_size, resolved_test_size = _resolve_split_sizes(
+        train_size, val_size, test_size, len(train_full), len(test_full)
+    )
+
     generator = torch.Generator().manual_seed(seed)
     train_val_idx = torch.randperm(len(train_full), generator=generator).tolist()
-    train_idx = train_val_idx[:train_size]
-    val_idx = train_val_idx[train_size : train_size + val_size]
-    test_idx = torch.randperm(len(test_full), generator=generator)[:test_size].tolist()
+    train_idx = train_val_idx[:resolved_train_size]
+    val_idx = train_val_idx[resolved_train_size : resolved_train_size + val_size]
+    test_idx = torch.randperm(len(test_full), generator=generator)[:resolved_test_size].tolist()
 
     train_loader = DataLoader(Subset(train_full, train_idx), batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(Subset(train_full, val_idx), batch_size=batch_size, shuffle=False)
@@ -388,11 +470,19 @@ def get_qat_backend(model_id: str) -> QATBackend:
     ~44MB pretrained-weight download and ~170MB CIFAR10 download only
     happen once; both cache to disk under `.cache/` after that). Each
     `run_qat_tuning` call still deep-copies `base_model` before mutating,
-    so the cached instance itself is never fine-tuned in place."""
+    so the cached instance itself is never fine-tuned in place. Dataset
+    scope (train/val/test/batch size) is read from `AUTOCIM_QAT_*` env vars
+    at call time (see the block above), not baked in at import time, so
+    tests that set them via `monkeypatch.setenv` before the first call for
+    a given `model_id` take effect."""
     if model_id not in _backend_cache:
         base_model = _get_base_model(model_id)
         train_loader, val_loader, test_loader = _build_cifar10_loaders(
-            train_size=_TRAIN_SIZE, val_size=_VAL_SIZE, test_size=_TEST_SIZE, batch_size=_BATCH_SIZE, seed=_DATASET_SEED
+            train_size=_resolve_size_env(_TRAIN_SIZE_ENV, _DEFAULT_TRAIN_SIZE, allow_full=True),
+            val_size=_resolve_int_env(_VAL_SIZE_ENV, _DEFAULT_VAL_SIZE),
+            test_size=_resolve_size_env(_TEST_SIZE_ENV, _DEFAULT_TEST_SIZE, allow_full=True),
+            batch_size=_resolve_int_env(_BATCH_SIZE_ENV, _DEFAULT_BATCH_SIZE),
+            seed=_resolve_int_env(_SEED_ENV, _DEFAULT_DATASET_SEED),
         )
         _backend_cache[model_id] = QATBackend(
             base_model=base_model,

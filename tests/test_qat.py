@@ -12,10 +12,19 @@ the shared cached base model.
 
 import copy
 
+import pytest
 import torch
 import torch.nn as nn
 
-from tools.qat import _MODEL_REGISTRY, apply_crossbar_quant_prune, group_quantizable_layers, run_qat_tuning
+from tools.qat import (
+    _MODEL_REGISTRY,
+    _resolve_int_env,
+    _resolve_size_env,
+    _resolve_split_sizes,
+    apply_crossbar_quant_prune,
+    group_quantizable_layers,
+    run_qat_tuning,
+)
 
 
 def test_model_registry_covers_resnet18_mobilenet_v2_and_vit_tiny():
@@ -172,3 +181,66 @@ def test_run_qat_tuning_returns_measured_accuracy_without_mutating_base_model(fa
 def test_run_qat_tuning_respects_max_epochs_cap(fake_qat_backend):
     result = run_qat_tuning(fake_qat_backend, stage_configs={}, default_config=(8, 0.0), max_epochs=1)
     assert result["epochs_run"] == 1
+
+
+# --- Configurable QAT dataset scope (AUTOCIM_QAT_*) -------------------------
+
+
+def test_resolve_size_env_returns_default_when_unset(monkeypatch):
+    monkeypatch.delenv("AUTOCIM_QAT_TRAIN_SIZE", raising=False)
+    assert _resolve_size_env("AUTOCIM_QAT_TRAIN_SIZE", 512, allow_full=True) == 512
+
+
+def test_resolve_size_env_parses_a_configured_integer(monkeypatch):
+    monkeypatch.setenv("AUTOCIM_QAT_TRAIN_SIZE", "2000")
+    assert _resolve_size_env("AUTOCIM_QAT_TRAIN_SIZE", 512, allow_full=True) == 2000
+
+
+def test_resolve_size_env_recognizes_full_sentinel_case_insensitively(monkeypatch):
+    monkeypatch.setenv("AUTOCIM_QAT_TRAIN_SIZE", "FULL")
+    assert _resolve_size_env("AUTOCIM_QAT_TRAIN_SIZE", 512, allow_full=True) == "full"
+
+
+def test_resolve_size_env_falls_back_to_default_on_garbage_value(monkeypatch):
+    monkeypatch.setenv("AUTOCIM_QAT_TRAIN_SIZE", "not-a-number")
+    assert _resolve_size_env("AUTOCIM_QAT_TRAIN_SIZE", 512, allow_full=True) == 512
+
+
+def test_resolve_size_env_falls_back_to_default_on_non_positive_value(monkeypatch):
+    monkeypatch.setenv("AUTOCIM_QAT_TRAIN_SIZE", "0")
+    assert _resolve_size_env("AUTOCIM_QAT_TRAIN_SIZE", 512, allow_full=True) == 512
+
+
+def test_resolve_int_env_returns_default_when_unset(monkeypatch):
+    monkeypatch.delenv("AUTOCIM_QAT_BATCH_SIZE", raising=False)
+    assert _resolve_int_env("AUTOCIM_QAT_BATCH_SIZE", 32) == 32
+
+
+def test_resolve_int_env_parses_a_configured_value(monkeypatch):
+    monkeypatch.setenv("AUTOCIM_QAT_BATCH_SIZE", "64")
+    assert _resolve_int_env("AUTOCIM_QAT_BATCH_SIZE", 32) == 64
+
+
+def test_resolve_split_sizes_passes_through_explicit_sizes_within_bounds():
+    train, test = _resolve_split_sizes(512, 128, 1000, train_available=50000, test_available=10000)
+    assert (train, test) == (512, 1000)
+
+
+def test_resolve_split_sizes_full_train_reserves_val_size_first():
+    train, test = _resolve_split_sizes("full", 128, 1000, train_available=50000, test_available=10000)
+    assert train == 50000 - 128
+
+
+def test_resolve_split_sizes_full_test_uses_the_whole_test_split():
+    train, test = _resolve_split_sizes(512, 128, "full", train_available=50000, test_available=10000)
+    assert test == 10000
+
+
+def test_resolve_split_sizes_raises_when_train_plus_val_exceeds_available():
+    with pytest.raises(ValueError, match="exceeds CIFAR10's 100-image train split"):
+        _resolve_split_sizes(90, 20, 10, train_available=100, test_available=100)
+
+
+def test_resolve_split_sizes_raises_when_test_exceeds_available():
+    with pytest.raises(ValueError, match="exceeds CIFAR10's 100-image test split"):
+        _resolve_split_sizes(50, 20, 200, train_available=100, test_available=100)

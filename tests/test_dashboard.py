@@ -91,6 +91,53 @@ def test_render_dashboard_html_handles_a_candidate_with_no_matching_planner_deci
     assert "0.9000" in output
 
 
+def test_calibration_section_warns_when_hw_spec_id_is_uncalibrated(state_factory):
+    state = state_factory(calibration_factors={}, calibration_provenance={})
+
+    output = render_dashboard_html(state)
+
+    assert "uncalibrated" in output
+    assert '<p class="calib-warning">' in output
+    assert '<p class="calib-ok">' not in output
+
+
+def test_calibration_section_shows_factor_and_citation_when_calibrated(state_factory):
+    state = state_factory(
+        hw_spec_id="calibrated_hw",
+        calibration_factors={"calibrated_hw": 1.2345},
+        calibration_provenance={
+            "calibrated_hw": {
+                "reference_energy_pj_per_mac": 0.047,
+                "source": "Peng et al., NeuroSim V1.5",
+                "note": "assumes 1 MAC == 1 op",
+            }
+        },
+    )
+
+    output = render_dashboard_html(state)
+
+    assert '<p class="calib-ok">' in output
+    assert "1.2345x" in output
+    assert "Peng et al., NeuroSim V1.5" in output
+    assert "assumes 1 MAC == 1 op" in output
+    assert '<p class="calib-warning">' not in output
+
+
+def test_calibration_section_ignores_factors_for_other_hw_spec_ids(state_factory):
+    """A calibration_factors/calibration_provenance entry seeded for a
+    *different* hw_spec_id (e.g. left over from a prior session on the same
+    process) must not be mistaken for this run's own calibration status."""
+    state = state_factory(
+        hw_spec_id="this_run_hw",
+        calibration_factors={"some_other_hw": 2.0},
+        calibration_provenance={"some_other_hw": {"reference_energy_pj_per_mac": 0.1, "source": "x", "note": None}},
+    )
+
+    output = render_dashboard_html(state)
+
+    assert "uncalibrated" in output
+
+
 def test_dashboard_renders_from_a_real_stubbed_graph_run(state_factory, registered_bad_hw_config):
     """End-to-end: a real (stubbed) multi-iteration graph run's resulting
     state -- not hand-built synthetic state -- must render cleanly, proving

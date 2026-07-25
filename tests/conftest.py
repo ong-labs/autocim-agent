@@ -44,6 +44,7 @@ def make_state(**overrides: Any) -> AutoCIMState:
         "planner_decisions": [],
         "metrics_store": {},
         "calibration_factors": {},
+        "calibration_provenance": {},
         "human_overrides": {},
         "planned_layer_configs": [],
         "model_id": "resnet18",

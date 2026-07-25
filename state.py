@@ -21,6 +21,15 @@ call, structurally recording *which* candidate was proposed and *why*
 only existed as a free-text line in `messages`. `tools/dashboard.py` joins
 this against `candidate_history` by `iteration` to show, per iteration,
 both what was tried and what it measured.
+
+`calibration_provenance` mirrors `calibration_factors` (`{hw_spec_id: {...}}`,
+same `merge_dicts` reducer) but carries *why* a factor is what it is --
+the matching literature reference's citation and stated uncertainty
+(`tools.calibration.describe_calibration`) -- so `tools/dashboard.py` can
+show a researcher which published number backs a candidate's energy
+figure, not just an opaque multiplier. Empty for any `hw_spec_id` that
+stayed uncalibrated (factor 1.0), same honesty rule as
+`calibration_factors` itself.
 """
 
 import operator
@@ -65,6 +74,7 @@ class AutoCIMState(TypedDict):
     planner_decisions: Annotated[List[Dict[str, Any]], operator.add]
     metrics_store: Annotated[Dict[str, Any], namespaced_metrics_reducer]
     calibration_factors: Annotated[Dict[str, float], merge_dicts]
+    calibration_provenance: Annotated[Dict[str, Dict[str, Any]], merge_dicts]
     human_overrides: Dict[str, Any]
     planned_layer_configs: List[Dict[str, Any]]
     model_id: str

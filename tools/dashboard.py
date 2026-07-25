@@ -122,6 +122,47 @@ def _table_rows_html(rows: List[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def _calibration_section_html(state: AutoCIMState) -> str:
+    """Whether this run's energy/latency numbers are grounded in a real
+    published reference (`tools.calibration`) or are still the uncorrected
+    analytical fast-approximation (`tools.cim_physics`) -- the honest stand-
+    in for "precise simulator vs fast-approximation error margin" this
+    project can actually make, given @mapper/@profiler don't bind a real
+    NeuroSim/CIM-Loop instance (CLAUDE.md 5.D Mock First). Uncalibrated is
+    not an error state -- it's the expected case for any hw_spec_id that
+    doesn't exactly match a known reference -- but it belongs on the
+    dashboard, not buried in a code comment, since it directly bears on how
+    much to trust the absolute accuracy/energy/latency numbers below."""
+    hw_spec_id = state.get("hw_spec_id")
+    factor = (state.get("calibration_factors") or {}).get(hw_spec_id)
+    provenance = (state.get("calibration_provenance") or {}).get(hw_spec_id)
+
+    if factor is None or provenance is None:
+        return (
+            '<p class="calib-warning">'
+            f"&#9888; hw_spec_id={html.escape(str(hw_spec_id))} is <strong>uncalibrated</strong> -- no published "
+            "literature reference exactly matches this hardware configuration (tools/calibration.py). "
+            "energy_pj/latency_ns figures below are analytical order-of-magnitude estimates "
+            "(tools/cim_physics.py), not validated against precise simulation or silicon. "
+            "Safe for comparing candidates <em>within this run</em>; do not treat the absolute numbers "
+            "as a validated benchmark."
+            "</p>"
+        )
+
+    source = html.escape(str(provenance.get("source") or ""))
+    note = html.escape(str(provenance.get("note") or ""))
+    ref_value = provenance.get("reference_energy_pj_per_mac")
+    caveat_html = f"<br><strong>Stated uncertainty:</strong> {note}" if note else ""
+    return (
+        '<p class="calib-ok">'
+        f"&#10003; hw_spec_id={html.escape(str(hw_spec_id))} is calibrated: analytical energy is scaled by "
+        f"<strong>{factor:.4f}x</strong> against a real published reference ({ref_value} pJ/MAC) -- "
+        f"<em>{source}</em>."
+        f"{caveat_html}"
+        "</p>"
+    )
+
+
 def _llm_usage_summary(state: AutoCIMState) -> Dict[str, Any]:
     usage = state.get("llm_usage", [])
     costs = [u["estimated_cost_usd"] for u in usage if u.get("estimated_cost_usd") is not None]
@@ -155,6 +196,8 @@ def render_dashboard_html(state: AutoCIMState) -> str:
   th, td {{ border: 1px solid #e5e7eb; padding: 6px 10px; text-align: left; font-size: 13px; }}
   th {{ background: #f9fafb; }}
   .summary {{ color: #374151; }}
+  .calib-warning {{ background: #fffbeb; border: 1px solid #fbbf24; padding: 10px 14px; border-radius: 6px; }}
+  .calib-ok {{ background: #f0fdf4; border: 1px solid #86efac; padding: 10px 14px; border-radius: 6px; }}
 </style>
 </head>
 <body>
@@ -169,6 +212,9 @@ def render_dashboard_html(state: AutoCIMState) -> str:
   LLM calls: {usage["n_calls"]} node-invocation(s), {usage["total_attempts"]} total attempt(s),
   {usage["n_failed"]} failed after retries, estimated cost: {cost_text}
 </p>
+
+<h2>Calibration / precision confidence</h2>
+{_calibration_section_html(state)}
 
 <h2>Pareto front movement (accuracy vs energy, blue = current rank 1)</h2>
 {_svg_pareto_chart(rows)}
