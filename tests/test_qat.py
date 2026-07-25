@@ -18,6 +18,7 @@ import torch.nn as nn
 
 from tools.qat import (
     _MODEL_REGISTRY,
+    _resolve_device,
     _resolve_int_env,
     _resolve_size_env,
     _resolve_split_sizes,
@@ -244,3 +245,37 @@ def test_resolve_split_sizes_raises_when_train_plus_val_exceeds_available():
 def test_resolve_split_sizes_raises_when_test_exceeds_available():
     with pytest.raises(ValueError, match="exceeds CIFAR10's 100-image test split"):
         _resolve_split_sizes(50, 20, 200, train_available=100, test_available=100)
+
+
+# --- Device selection (AUTOCIM_QAT_DEVICE) -----------------------------------
+
+
+def test_resolve_device_explicit_argument_wins_over_everything():
+    assert _resolve_device("cpu") == torch.device("cpu")
+
+
+def test_resolve_device_env_var_used_when_no_explicit_argument(monkeypatch):
+    monkeypatch.setenv("AUTOCIM_QAT_DEVICE", "cpu")
+    assert _resolve_device(None) == torch.device("cpu")
+
+
+def test_resolve_device_explicit_argument_beats_env_var(monkeypatch):
+    monkeypatch.setenv("AUTOCIM_QAT_DEVICE", "cpu")
+    assert _resolve_device("meta") == torch.device("meta")
+
+
+def test_resolve_device_auto_detects_a_real_device_when_unconfigured(monkeypatch):
+    monkeypatch.delenv("AUTOCIM_QAT_DEVICE", raising=False)
+    resolved = _resolve_device(None)
+    # Whatever this machine actually has (GPU or not), _resolve_device must
+    # agree with torch's own capability checks -- not silently assume one
+    # or the other.
+    if torch.cuda.is_available():
+        assert resolved == torch.device("cuda")
+    else:
+        assert resolved.type in ("cpu", "mps")
+
+
+def test_run_qat_tuning_reports_the_device_it_actually_used(fake_qat_backend):
+    result = run_qat_tuning(fake_qat_backend, stage_configs={}, default_config=(4, 0.25), max_epochs=1, device="cpu")
+    assert result["device"] == "cpu"
