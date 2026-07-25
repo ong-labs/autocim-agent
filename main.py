@@ -12,6 +12,15 @@ session paused at `hitl_human_approval` (or killed mid-run) survives the
 process exiting. Re-invoking this CLI with the same `--thread-id` picks up
 exactly where it left off: `run_session` checks `graph.get_state(config)`
 before deciding whether to start a fresh run or resume a persisted one.
+
+`main()` loads `.env` then `.env.local` (the latter overriding, if present
+-- same convention as Next.js/CRA) before touching `argparse`, so
+`AUTOCIM_PLANNER_MODEL`/API keys don't need re-exporting in every new
+shell. Deliberately *not* done at module import time: `tests/test_main_cli.py`
+imports this module directly, and a stray `.env.local` (real API keys,
+gitignored) silently landing in `os.environ` during a test run would be a
+surprising, hard-to-notice side effect of just importing a module -- this
+way it only ever fires for an actual `python main.py` invocation.
 """
 
 from __future__ import annotations
@@ -23,6 +32,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from dotenv import load_dotenv
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command, Interrupt
 from pydantic import ValidationError
@@ -386,6 +396,9 @@ def run_session(
 
 
 def main() -> None:
+    load_dotenv()  # .env: shared/base defaults, if present
+    load_dotenv(".env.local", override=True)  # .env.local: personal overrides (API keys), gitignored
+
     args = parse_args()
     checkpoint_db = args.checkpoint_db or str(DEFAULT_CHECKPOINT_DB)
     if checkpoint_db != ":memory:":
