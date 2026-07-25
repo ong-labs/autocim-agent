@@ -5,11 +5,17 @@ window (`middleware.py`'s context-pruning operates on it) -- not something a
 researcher can grep, filter by iteration, or machine-parse across a run
 shared with teammates. This module is the separate structured channel real
 multi-researcher use needs: one JSON object per notable event
-(`log_event`), written as JSON Lines to `<AUTOCIM_LOG_DIR>/<run_id>.jsonl`
+(`log_event`), always written as JSON Lines to `<AUTOCIM_LOG_DIR>/<run_id>.jsonl`
 (one file per run -- `nodes.common.run_id_for` -- so concurrent
-researchers' sessions never interleave in the same file) and mirrored to
-stdout via the stdlib `logging` module -- no new dependency, `tail -f`-able,
-and machine-parseable line by line.
+researchers' sessions never interleave in the same file) -- no new
+dependency, `tail -f`-able, and machine-parseable line by line.
+
+Mirroring the same JSON lines to stdout is opt-in (`AUTOCIM_LOG_STDOUT=1`),
+not default: `main.py`'s own per-node summary (`stream_until_interrupt`)
+already gives a human watching the terminal live progress, so mirroring
+every event here too would just print the same information twice in two
+different formats. Set `AUTOCIM_LOG_STDOUT=1` for the old
+`tail -f`/log-aggregator-piping use case.
 
 Callers (`nodes/planner.py`'s `candidate_proposed`, `nodes/evaluator.py`'s
 `candidate_evaluated`) log events that echo already-structured
@@ -42,6 +48,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 _LOG_DIR_ENV = "AUTOCIM_LOG_DIR"
+_STDOUT_ENV = "AUTOCIM_LOG_STDOUT"
 _DEFAULT_LOG_DIR = Path(__file__).resolve().parent / ".cache" / "logs"
 _REPO_ROOT = Path(__file__).resolve().parent
 
@@ -124,9 +131,10 @@ def _get_run_logger(run_id: str) -> logging.Logger:
 
     formatter = _JsonLineFormatter()
 
-    stream_handler = logging.StreamHandler(sys.stdout)
-    stream_handler.setFormatter(formatter)
-    logger.addHandler(stream_handler)
+    if os.environ.get(_STDOUT_ENV):
+        stream_handler = logging.StreamHandler(sys.stdout)
+        stream_handler.setFormatter(formatter)
+        logger.addHandler(stream_handler)
 
     log_dir = _log_dir()
     log_dir.mkdir(parents=True, exist_ok=True)
