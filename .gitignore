@@ -3,14 +3,44 @@
 # something to commit (the CIFAR10 cache alone is ~340MB).
 .cache/
 scratch_qat_test/
+# observability.py's default AUTOCIM_LOG_DIR and any ad-hoc log output.
+logs/
+*.log
+*.jsonl
+# tools/dashboard.py's --dashboard-out target, if written into the repo root.
+dashboard*.html
+
+# Secrets / local config -- provider API keys (ANTHROPIC_API_KEY etc.) and
+# any per-machine override belong in the environment or an untracked .env,
+# never committed.
+.env
+.env.*
+*.pem
+*.key
+
+# Model/data artifacts -- pretrained weights and datasets belong in .cache/
+# (already ignored above) or an external store, never in git history.
+*.pt
+*.pth
+*.ckpt
+*.safetensors
 
 # Python
 __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 .venv/
 venv/
+.ipynb_checkpoints/
+
+# Editor/IDE
+.vscode/
+.idea/
 
 # Local-only Claude Code settings (permissions/tool config specific to one
 # machine) -- a shared .claude/settings.json, if one is ever added, stays
