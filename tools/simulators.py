@@ -81,6 +81,10 @@ def tuner_tool(args: TunerToolInput) -> TunerToolOutput:
             "avg_weight_bits": avg_weight_bits,
             "avg_column_pruning_ratio": avg_pruning_ratio,
             "layer_configs": [lc.model_dump(mode="json") for lc in args.layer_configs],
+            # tools/qat.py's run_qat_tuning auto-detects CUDA/MPS/CPU
+            # (AUTOCIM_QAT_DEVICE overrides) -- echoed back so it's visible
+            # in the observability log / dashboard, not just inferred.
+            "device": tuning_result["device"],
         },
     )
 
