@@ -4,7 +4,7 @@ Every other planner test (tests/test_planner_llm.py) runs against
 FAKE_LAYER_GROUPS' 2 stages (tests/conftest.py's autouse
 `stub_planner_layer_groups`), which is too small to actually exercise the
 "per-real-stage independent search" behavior this module adds -- with only
-2 stages, `_warmup_count` never rises above its floor of 3, and a bug that
+2 stages, `warmup_count` never rises above its floor of 3, and a bug that
 silently fanned one flat point out to every stage would be invisible. These
 tests monkeypatch `get_layer_groups` again, locally, to a larger stage set.
 """
@@ -24,13 +24,13 @@ def test_warmup_count_scales_with_real_stage_count(monkeypatch, state_factory, r
     monkeypatch.setattr(planner_module, "get_layer_groups", lambda model_id: dict(FAKE_STAGES))
     state = state_factory(hw_spec_id=registered_hw_config.hw_spec_id)
 
-    stage_names = planner_module._real_stage_names(state["model_id"])
+    stage_names = planner_module.real_stage_names(state["model_id"])
     assert len(stage_names) == 5
-    assert planner_module._warmup_count(len(stage_names)) == 5  # floor(3) < 5 stages <= cap(12)
+    assert planner_module.warmup_count(len(stage_names)) == 5  # floor(3) < 5 stages <= cap(12)
 
 
 def test_warmup_count_is_capped_for_a_high_stage_count():
-    assert planner_module._warmup_count(20) == planner_module._MAX_WARMUP_CANDIDATES
+    assert planner_module.warmup_count(20) == planner_module._MAX_WARMUP_CANDIDATES
 
 
 def test_propose_stage_points_returns_one_independent_point_per_stage(
@@ -38,7 +38,7 @@ def test_propose_stage_points_returns_one_independent_point_per_stage(
 ):
     monkeypatch.setattr(planner_module, "get_layer_groups", lambda model_id: dict(FAKE_STAGES))
     state = state_factory(hw_spec_id=registered_hw_config.hw_spec_id)
-    stage_names = planner_module._real_stage_names(state["model_id"])
+    stage_names = planner_module.real_stage_names(state["model_id"])
 
     stage_points, search_tag = planner_module._propose_stage_points(state, stage_names)
 
@@ -73,8 +73,8 @@ def test_surrogate_phase_uses_candidate_historys_layer_configs(monkeypatch, stat
     to place them in the real per-stage search space."""
     monkeypatch.setattr(planner_module, "get_layer_groups", lambda model_id: dict(FAKE_STAGES))
     state = state_factory(hw_spec_id=registered_hw_config.hw_spec_id)
-    stage_names = planner_module._real_stage_names(state["model_id"])
-    n_warmup = planner_module._warmup_count(len(stage_names))
+    stage_names = planner_module.real_stage_names(state["model_id"])
+    n_warmup = planner_module.warmup_count(len(stage_names))
 
     good_layer_configs = [
         {"layer_name": name, "weight_bits": 8, "activation_bits": 8, "column_pruning_ratio": 0.0}
