@@ -7,6 +7,19 @@ produced this iteration against its `schemas/tools.py` model, accumulates
 `needs_hitl`/`retry_count`; `evaluator_router` reads those flags to route
 the corresponding conditional edge (Converged / HITL / Re-plan).
 
+`is_converged` is the AND of two independent checks, both of which must
+pass: @verifier's own IR-drop/noise physical-feasibility check (unchanged,
+still computed in tools/simulators.py's verifier_tool), and -- new --
+whether this candidate actually meets every *configured*
+`target_accuracy`/`target_energy_pj`/`target_latency_ms` (state.py). A
+hardware config can be physically viable yet still produce a candidate
+nowhere near good enough to deploy (e.g. real accuracy 0.20 against a 0.7
+target); before this, that scenario was reported as "Converged (Done)"
+purely because IR-drop/noise looked fine, which let a run stop having
+never actually met its real research goal. Missing target fields (`None`,
+the default) skip that dimension's check entirely -- a run that never
+configures targets behaves exactly as before.
+
 This is also where `candidate_history` (state.py) gets its one entry per
 fully-evaluated iteration: @evaluator is the first node with the complete
 multi-objective picture (accuracy from @tuner, energy/latency from
@@ -67,6 +80,32 @@ def validate_metrics(metrics: Dict[str, Any]) -> List[str]:
     return validation_errors
 
 
+def check_targets(
+    accuracy: Optional[float],
+    energy_pj: Optional[float],
+    noc_latency_ms: Optional[float],
+    target_accuracy: Optional[float],
+    target_energy_pj: Optional[float],
+    target_latency_ms: Optional[float],
+) -> List[str]:
+    """Human-readable reasons any *configured* target wasn't met -- empty
+    if every configured target is satisfied, or none are configured at
+    all (the default: this dimension simply isn't gated). Accuracy is
+    higher-is-better (must be >= target); energy/latency are
+    lower-is-better (must be <= target). A missing metric value (`None`)
+    can never be judged as meeting a configured target -- same "incomplete
+    data is never silently fine" rule `validate_metrics` already applies,
+    just for target-achievement instead of schema validity."""
+    reasons = []
+    if target_accuracy is not None and (accuracy is None or accuracy < target_accuracy):
+        reasons.append(f"accuracy {accuracy} below target {target_accuracy}")
+    if target_energy_pj is not None and (energy_pj is None or energy_pj > target_energy_pj):
+        reasons.append(f"energy_pj {energy_pj} above target {target_energy_pj}")
+    if target_latency_ms is not None and (noc_latency_ms is None or noc_latency_ms > target_latency_ms):
+        reasons.append(f"noc_latency_ms {noc_latency_ms} above target {target_latency_ms}")
+    return reasons
+
+
 def build_candidate_entry(
     history: List[Dict[str, Any]],
     metrics: Dict[str, Any],
@@ -125,8 +164,25 @@ def evaluator_node(state: AutoCIMState) -> Dict[str, Any]:
 
     validation_errors = validate_metrics(metrics)
 
+    tuner_data = (metrics.get("tuner") or {}).get("data") or {}
     verifier_data = (metrics.get("verifier") or {}).get("data") or {}
-    is_converged = not validation_errors and bool(verifier_data.get("is_converged", False))
+    hw_verified = not validation_errors and bool(verifier_data.get("is_converged", False))
+
+    # Only meaningful once the schema/HW-feasibility checks above already
+    # passed -- an incomplete/invalid iteration has no trustworthy
+    # accuracy/energy/latency to judge against a target in the first place.
+    target_errors: List[str] = []
+    if not validation_errors:
+        target_errors = check_targets(
+            tuner_data.get("accuracy"),
+            verifier_data.get("energy_pj"),
+            verifier_data.get("noc_latency_ms"),
+            state.get("target_accuracy"),
+            state.get("target_energy_pj"),
+            state.get("target_latency_ms"),
+        )
+
+    is_converged = hw_verified and not target_errors
 
     candidate_entry = build_candidate_entry(
         state.get("candidate_history", []), metrics, iteration_count, is_converged, has_validation_errors=bool(validation_errors)
@@ -150,10 +206,16 @@ def evaluator_node(state: AutoCIMState) -> Dict[str, Any]:
 
     new_retry_count = retry_count + 1
     needs_hitl = new_retry_count >= MAX_RETRY_LIMIT
+    if validation_errors:
+        reason = "; ".join(validation_errors)
+    elif not hw_verified:
+        reason = "verifier reported not converged"
+    else:
+        reason = "; ".join(target_errors)
     failure_entry = {
         "iteration": iteration_count,
         "retry_count": new_retry_count,
-        "reason": "; ".join(validation_errors) if validation_errors else "verifier reported not converged",
+        "reason": reason,
     }
     log_event(
         run_id_for(state),
