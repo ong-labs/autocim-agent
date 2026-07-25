@@ -44,8 +44,35 @@ _OUTPUT_SCHEMAS = (
 )
 
 
-def _build_candidate_entry(
-    state: AutoCIMState, metrics: Dict[str, Any], iteration_count: int, is_converged: bool, has_validation_errors: bool
+def validate_metrics(metrics: Dict[str, Any]) -> List[str]:
+    """Validation errors (empty if all four tools' outputs are present and
+    schema-valid with `ToolStatus.SUCCESS`) -- pulled out of `evaluator_node`
+    so `tools/batch_warmup.py`'s parallel warm-up runner validates each
+    candidate's raw tool results with the exact same rule the sequential
+    graph loop uses, rather than a second, potentially-diverging copy of
+    this logic."""
+    validation_errors = []
+    for node_name, schema in _OUTPUT_SCHEMAS:
+        raw = metrics.get(node_name)
+        if raw is None:
+            validation_errors.append(f"{node_name}: missing from metrics_store")
+            continue
+        try:
+            parsed = schema(**raw)
+        except Exception as exc:  # noqa: BLE001 -- record and keep validating the rest
+            validation_errors.append(f"{node_name}: {exc}")
+            continue
+        if parsed.status != ToolStatus.SUCCESS:
+            validation_errors.append(f"{node_name}: status={parsed.status}, error={parsed.error}")
+    return validation_errors
+
+
+def build_candidate_entry(
+    history: List[Dict[str, Any]],
+    metrics: Dict[str, Any],
+    iteration_count: int,
+    is_converged: bool,
+    has_validation_errors: bool,
 ) -> Optional[Dict[str, Any]]:
     """None when this iteration's multi-objective result is incomplete (a
     sub-tool failed/is missing, or is otherwise schema-invalid) -- an
@@ -55,8 +82,14 @@ def _build_candidate_entry(
     rather than only "are these fields non-None": @verifier always returns
     ToolStatus.SUCCESS itself and echoes whatever @mapper/@profiler gave it,
     so a failed upstream tool doesn't reliably leave verifier's own fields
-    None -- the validation pass already run in `evaluator_node` is the
-    authoritative signal that this iteration's numbers are trustworthy."""
+    None -- `validate_metrics`'s result is the authoritative signal that
+    this iteration's numbers are trustworthy.
+
+    Takes `history` (the accumulated `candidate_history` to rank against)
+    directly rather than the full `AutoCIMState` -- `tools/batch_warmup.py`
+    builds entries for candidates that were never part of any graph state,
+    just a growing in-memory list, and this keeps that reuse a plain data
+    dependency instead of requiring a fake state dict."""
     if has_validation_errors:
         return None
 
@@ -81,7 +114,7 @@ def _build_candidate_entry(
     if any(candidate[key] is None for key in ("avg_weight_bits", "avg_column_pruning_ratio", "accuracy", "energy_pj", "noc_latency_ms")):
         return None
 
-    candidate["pareto_rank"] = compute_pareto_rank(candidate, state.get("candidate_history", []))
+    candidate["pareto_rank"] = compute_pareto_rank(candidate, history)
     return candidate
 
 
@@ -90,25 +123,13 @@ def evaluator_node(state: AutoCIMState) -> Dict[str, Any]:
     iteration_count = state.get("iteration_count", 0)
     retry_count = state.get("retry_count", 0)
 
-    validation_errors = []
-    for node_name, schema in _OUTPUT_SCHEMAS:
-        raw = metrics.get(node_name)
-        if raw is None:
-            validation_errors.append(f"{node_name}: missing from metrics_store")
-            continue
-        try:
-            parsed = schema(**raw)
-        except Exception as exc:  # noqa: BLE001 -- record and keep validating the rest
-            validation_errors.append(f"{node_name}: {exc}")
-            continue
-        if parsed.status != ToolStatus.SUCCESS:
-            validation_errors.append(f"{node_name}: status={parsed.status}, error={parsed.error}")
+    validation_errors = validate_metrics(metrics)
 
     verifier_data = (metrics.get("verifier") or {}).get("data") or {}
     is_converged = not validation_errors and bool(verifier_data.get("is_converged", False))
 
-    candidate_entry = _build_candidate_entry(
-        state, metrics, iteration_count, is_converged, has_validation_errors=bool(validation_errors)
+    candidate_entry = build_candidate_entry(
+        state.get("candidate_history", []), metrics, iteration_count, is_converged, has_validation_errors=bool(validation_errors)
     )
     candidate_history: List[Dict[str, Any]] = [candidate_entry] if candidate_entry is not None else []
 
