@@ -17,6 +17,16 @@ Callers (`nodes/planner.py`'s `candidate_proposed`, `nodes/evaluator.py`'s
 file is the narrative/audit trail of *when* and *in what order* things
 happened, not a second source of truth; `tools/dashboard.py` reads state
 directly, not this log.
+
+Every record also carries `code_version` (`_get_code_version`): the search
+algorithm and simulators here are still actively changing, so "which code
+produced this candidate_history/Pareto front" is real information a
+researcher needs across a run that might span several code changes
+(a session can be paused at HITL for days) -- `AutoCIMState` itself has no
+natural place for this (it's a property of the process that ran a step,
+not of the optimization data itself), so it lives in this audit log
+instead, computed fresh (and cheaply cached) from `git`, not persisted
+into state.
 """
 
 from __future__ import annotations
@@ -25,15 +35,57 @@ import json
 import logging
 import os
 import re
+import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 _LOG_DIR_ENV = "AUTOCIM_LOG_DIR"
 _DEFAULT_LOG_DIR = Path(__file__).resolve().parent / ".cache" / "logs"
+_REPO_ROOT = Path(__file__).resolve().parent
 
 _loggers: Dict[str, logging.Logger] = {}
+_code_version_cache: Optional[str] = None
+
+
+def _get_code_version() -> str:
+    """Short git commit hash, `-dirty` suffixed if the working tree has
+    uncommitted changes, or `"unknown"` if `git`/a repo isn't available
+    (e.g. a packaged install with no `.git` directory) -- never raises,
+    since a missing version string shouldn't break logging. Cached after
+    the first real call: this shells out to `git`, and the answer can't
+    change within one process's lifetime."""
+    global _code_version_cache
+    if _code_version_cache is not None:
+        return _code_version_cache
+
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=_REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if commit.returncode != 0:
+            _code_version_cache = "unknown"
+            return _code_version_cache
+
+        version = commit.stdout.strip()
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=_REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if status.returncode == 0 and status.stdout.strip():
+            version += "-dirty"
+        _code_version_cache = version
+    except Exception:  # noqa: BLE001 -- git missing/not a repo/timeout: never fatal here
+        _code_version_cache = "unknown"
+    return _code_version_cache
 
 
 def _log_dir() -> Path:
@@ -96,6 +148,7 @@ def log_event(run_id: str, node: str, event: str, iteration: int, **fields: Any)
         "iteration": iteration,
         "node": node,
         "event": event,
+        "code_version": _get_code_version(),
         **fields,
     }
     logger = _get_run_logger(run_id)
@@ -108,7 +161,14 @@ def reset_loggers() -> None:
     never need this (loggers live for the process's lifetime) -- it exists
     so tests get a fresh logger (and thus a fresh log file, honoring a
     just-changed AUTOCIM_LOG_DIR) instead of a stale cached one left over
-    from an earlier test's tmp_path."""
+    from an earlier test's tmp_path.
+
+    Deliberately does *not* clear `_code_version_cache`: unlike the log
+    dir, the code version is a real process-level constant (git HEAD can't
+    change mid-test-run), so recomputing it (a `git` subprocess call) on
+    every single test via the autouse fixture that calls this would be
+    pure overhead. The one test exercising the git-unavailable fallback
+    resets `_code_version_cache` itself."""
     for logger in _loggers.values():
         for handler in list(logger.handlers):
             handler.close()

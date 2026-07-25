@@ -18,12 +18,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command, Interrupt
+from pydantic import ValidationError
 
 from graph import build_graph
 from middleware import register_hw_config
@@ -92,14 +94,43 @@ def parse_args() -> argparse.Namespace:
             "to this path whenever the session pauses or finishes."
         ),
     )
+    parser.add_argument(
+        "--list-sessions",
+        action="store_true",
+        help=(
+            "List every thread_id found in --checkpoint-db (status, iteration_count, "
+            "model_id/hw_spec_id) and exit -- a researcher otherwise has to remember "
+            "thread_ids manually to resume/inspect a past session."
+        ),
+    )
     return parser.parse_args()
+
+
+class HWConfigError(RuntimeError):
+    """Raised by `load_hw_config` on a missing/malformed/schema-invalid
+    `--hw-config` file. Caught in `main()` to print a clean, actionable
+    message instead of a raw traceback -- a researcher pointing this CLI
+    at a hand-edited JSON file (see `examples/hw_configs/`) shouldn't need
+    to read a Python stack trace to find a typo."""
 
 
 def load_hw_config(path: Optional[str]) -> HWConfig:
     if path is None:
         return DEFAULT_HW_CONFIG
-    with open(path, "r", encoding="utf-8") as f:
-        return HWConfig(**json.load(f))
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        raise HWConfigError(f"--hw-config file not found: {path!r}") from None
+    except json.JSONDecodeError as exc:
+        raise HWConfigError(f"--hw-config file {path!r} is not valid JSON: {exc}") from None
+    try:
+        return HWConfig(**raw)
+    except ValidationError as exc:
+        raise HWConfigError(
+            f"--hw-config file {path!r} doesn't match HWConfig's schema "
+            f"(schemas/config.py; see examples/hw_configs/ for a working example):\n{exc}"
+        ) from None
 
 
 def build_initial_state(model_id: str, hw_config: HWConfig) -> AutoCIMState:
@@ -175,6 +206,65 @@ def print_final_state(state: Dict[str, Any]) -> None:
     print(f"is_converged  : {state.get('is_converged')}")
     print(f"iteration_count: {state.get('iteration_count')}")
     print(f"metrics_store : {state.get('metrics_store')}")
+
+
+def list_sessions(checkpointer) -> List[Dict[str, Any]]:
+    """One row per distinct `thread_id` found in `checkpointer`'s DB,
+    newest-first (`SqliteSaver.list`'s own order). `checkpointer.list(None)`
+    -- no `config`, hence no `thread_id` filter -- returns every checkpoint
+    across every thread; each thread has many (one per completed node), so
+    this keeps only the first (newest) one seen per thread_id. Reads each
+    thread's actual current state via `graph.get_state()` (the same public
+    API `write_dashboard`/`get_pending_interrupt` already use) rather than
+    parsing raw checkpoint internals."""
+    graph = build_graph(checkpointer=checkpointer)
+    # Materialize fully before calling graph.get_state() on any of them:
+    # SqliteSaver.list() is a generator holding its own cursor/transaction
+    # open on `checkpointer`'s connection for as long as it's being
+    # iterated -- calling get_state() (which needs the same connection)
+    # *during* that iteration hangs. Draining it into a plain list first
+    # closes that cursor before any nested query runs.
+    checkpoint_tuples = list(checkpointer.list(None))
+
+    sessions: List[Dict[str, Any]] = []
+    seen_thread_ids = set()
+    for checkpoint_tuple in checkpoint_tuples:
+        thread_id = checkpoint_tuple.config["configurable"]["thread_id"]
+        if thread_id in seen_thread_ids:
+            continue
+        seen_thread_ids.add(thread_id)
+
+        snapshot = graph.get_state({"configurable": {"thread_id": thread_id}})
+        values = snapshot.values
+        sessions.append(
+            {
+                "thread_id": thread_id,
+                "model_id": values.get("model_id"),
+                "hw_spec_id": values.get("hw_spec_id"),
+                "iteration_count": values.get("iteration_count"),
+                "is_converged": values.get("is_converged"),
+                "paused": bool(snapshot.next),
+            }
+        )
+    return sessions
+
+
+def print_sessions(sessions: List[Dict[str, Any]]) -> None:
+    if not sessions:
+        print("No sessions found in this checkpoint DB.")
+        return
+    print(f"{'thread_id':<38} {'model_id':<14} {'hw_spec_id':<24} {'iter':>4}  status")
+    for s in sessions:
+        if s["paused"]:
+            status = "paused (HITL)"
+        elif s["is_converged"]:
+            status = "converged"
+        else:
+            status = "in-progress"
+        print(
+            f"{s['thread_id']:<38} {str(s['model_id']):<14} {str(s['hw_spec_id']):<24} "
+            f"{str(s['iteration_count']):>4}  {status}"
+        )
 
 
 def write_dashboard(graph, config: Dict[str, Any], dashboard_out: Optional[str]) -> None:
@@ -259,11 +349,24 @@ def run_session(
 
 def main() -> None:
     args = parse_args()
-    hw_config = load_hw_config(args.hw_config)
-    thread_id = args.thread_id or str(uuid.uuid4())
     checkpoint_db = args.checkpoint_db or str(DEFAULT_CHECKPOINT_DB)
     if checkpoint_db != ":memory:":
         Path(checkpoint_db).parent.mkdir(parents=True, exist_ok=True)
+
+    if args.list_sessions:
+        # No --hw-config needed to just inspect what's persisted -- a
+        # researcher checking session status shouldn't need a valid
+        # HWConfig file on hand for that.
+        with SqliteSaver.from_conn_string(checkpoint_db) as checkpointer:
+            print_sessions(list_sessions(checkpointer))
+        return
+
+    try:
+        hw_config = load_hw_config(args.hw_config)
+    except HWConfigError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from None
+    thread_id = args.thread_id or str(uuid.uuid4())
 
     with SqliteSaver.from_conn_string(checkpoint_db) as checkpointer:
         run_session(args.model_id, hw_config, thread_id, checkpointer, dashboard_out=args.dashboard_out)

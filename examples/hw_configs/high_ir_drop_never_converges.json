@@ -1,0 +1,13 @@
+{
+  "hw_spec_id": "high_ir_drop_never_converges",
+  "crossbar_rows": 128,
+  "crossbar_cols": 128,
+  "num_tiles": 16,
+  "adc_bits": 8,
+  "dac_bits": 4,
+  "noc_topology": "mesh",
+  "noc_link_bandwidth_gbps": 10.0,
+  "wire_resistance_ohm_per_um": 5.0,
+  "device_noise_sigma": 0.05,
+  "sram_buffer_kb": 64.0
+}

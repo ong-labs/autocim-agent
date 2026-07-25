@@ -81,10 +81,11 @@ Groq/Gemini를 쓰려면 `pip install -r requirements.txt`에 이미 포함된 `
 | 옵션 | 설명 |
 |---|---|
 | `--model-id` | 대상 모델 (`resnet18`, `mobilenet_v2`, `vit_tiny`) |
-| `--hw-config PATH` | `HWConfig` 필드를 담은 JSON 파일 (생략 시 내장 샘플 스펙 사용) |
+| `--hw-config PATH` | `HWConfig` 필드를 담은 JSON 파일 (생략 시 내장 샘플 스펙 사용). 예시는 [`examples/hw_configs/`](examples/hw_configs/) 참고 |
 | `--thread-id ID` | 세션 재개용 LangGraph thread id |
 | `--checkpoint-db PATH` | 체크포인트 SQLite 경로 (`:memory:`로 영속성 끄기 가능) |
 | `--dashboard-out PATH` | 세션이 멈추거나 끝날 때마다 HTML 대시보드를 이 경로에 기록 |
+| `--list-sessions` | `--checkpoint-db`에 저장된 모든 세션(thread_id, 상태, iteration_count)을 나열하고 종료 |
 
 ### 주요 환경변수
 

@@ -8,7 +8,9 @@ log files without touching the real repo's .cache/logs/.
 """
 
 import json
+import subprocess
 
+import observability
 from observability import log_event
 
 
@@ -76,3 +78,46 @@ def test_reset_loggers_lets_a_new_log_dir_take_effect(tmp_path, monkeypatch):
     observability.reset_loggers()
     log_event("same_run_id", node="planner", event="candidate_proposed", iteration=2)
     assert (second_dir / "same_run_id.jsonl").exists()
+
+
+# --- code_version (git commit tracking) ---------------------------------------
+
+
+def test_log_event_includes_a_real_code_version():
+    """This repo is a real git checkout (verified elsewhere in this
+    session), so code_version must be a real short hash, not the
+    'unknown' fallback -- proves _get_code_version actually shells out to
+    git rather than always falling back."""
+    record = log_event("v", node="planner", event="candidate_proposed", iteration=1)
+    assert record["code_version"] != "unknown"
+    assert len(record["code_version"].split("-")[0]) >= 7
+
+
+def test_get_code_version_falls_back_to_unknown_when_git_is_unavailable(monkeypatch):
+    observability._code_version_cache = None
+    try:
+        def _raise(*args, **kwargs):
+            raise FileNotFoundError("git not found")
+
+        monkeypatch.setattr(observability.subprocess, "run", _raise)
+        assert observability._get_code_version() == "unknown"
+    finally:
+        observability._code_version_cache = None  # don't leak "unknown" into later tests
+
+
+def test_get_code_version_is_cached_across_calls(monkeypatch):
+    observability._code_version_cache = None
+    try:
+        calls = []
+        real_run = subprocess.run
+
+        def _counting_run(*args, **kwargs):
+            calls.append(args)
+            return real_run(*args, **kwargs)
+
+        monkeypatch.setattr(observability.subprocess, "run", _counting_run)
+        observability._get_code_version()
+        observability._get_code_version()
+        assert len(calls) == 2  # rev-parse + status, once total, not once per call
+    finally:
+        observability._code_version_cache = None
