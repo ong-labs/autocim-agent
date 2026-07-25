@@ -7,8 +7,10 @@ scratch_qat_test/
 logs/
 *.log
 *.jsonl
-# tools/dashboard.py's --dashboard-out target, if written into the repo root.
+# tools/dashboard.py's --dashboard-out target, if written into the repo root
+# -- README.md's own examples name it both ways, so cover both.
 dashboard*.html
+report*.html
 
 # Secrets / local config -- provider API keys (ANTHROPIC_API_KEY etc.) and
 # any per-machine override belong in the environment or an untracked .env,
