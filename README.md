@@ -72,7 +72,16 @@ pip install -r requirements.txt
 
 ## 실행
 
-LLM provider/모델을 지정해야 합니다 (`langchain.chat_models.init_chat_model` 스펙 문자열):
+LLM provider/모델을 지정해야 합니다 (`langchain.chat_models.init_chat_model` 스펙 문자열). `.env.example`을 `.env.local`로 복사해 값을 채우면 -- `main.py`가 실행할 때마다 자동으로 읽어들이므로 (import 시점이 아니라 `python main.py` 실행 시점에만; gitignore됨) -- 터미널을 새로 열 때마다 다시 `export`할 필요가 없습니다:
+
+```bash
+cp .env.example .env.local
+# .env.local을 열어 AUTOCIM_PLANNER_MODEL과 해당 provider의 API 키를 채우기
+
+python main.py --model-id resnet18 --dashboard-out report.html
+```
+
+또는 기존처럼 셸에서 직접 `export`해도 동일하게 동작합니다:
 
 ```bash
 export AUTOCIM_PLANNER_MODEL="anthropic:claude-sonnet-4-5-20250929"
