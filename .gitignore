@@ -12,9 +12,11 @@ dashboard*.html
 
 # Secrets / local config -- provider API keys (ANTHROPIC_API_KEY etc.) and
 # any per-machine override belong in the environment or an untracked .env,
-# never committed.
+# never committed. .env.example is the exception: no real values, just
+# documents which variables main.py's dotenv loading understands.
 .env
 .env.*
+!.env.example
 *.pem
 *.key
 
