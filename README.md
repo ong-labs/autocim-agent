@@ -29,7 +29,7 @@ graph TD
 | 에이전트 | 역할 | 실제 구현 여부 |
 |---|---|---|
 | `@planner` | LHS 워밍업 + IDW 대리모델/UCB 탐색(stage별 독립, 최대 40차원), LLM 도구 호출로 최종 확정 | 실제 |
-| `@tuner` | 크로스바 정렬 fake-quantization + 구조적 컬럼 프루닝, 실제 QAT fine-tuning (`tools/qat.py`) | 실제 (CIFAR10 서브셋) |
+| `@tuner` | 크로스바 정렬 fake-quantization + 구조적 컬럼 프루닝, 실제 QAT fine-tuning (`tools/qat.py`) | 실제 (CIFAR10 서브셋, CUDA/MPS/CPU 자동 감지) |
 | `@mapper` / `@profiler` | NoC 홉카운트/대역폭 매핑, ADC/DAC/크로스바 에너지·지연 물리 시뮬레이션 | 실제 (fast-approximation) |
 | `@verifier` | IR-drop/노이즈 마진 기반 수렴 판정 | 실제 |
 | `@evaluator` | Pydantic 스키마 검증, NSGA-II 스타일 Pareto rank, 재탐색/HITL 라우팅 | 실제 |
@@ -41,6 +41,8 @@ graph TD
 - **HITL(Human-in-the-Loop)**: 수렴 정체 시 연구원 개입 요청 (dynamic `interrupt()`)
 - **LLM 호출 운영**: 재시도/지수 백오프, rate-limit 대응, 토큰/비용 추적, 누적 비용·토큰 상한(kill-switch)
 - **구조화된 관측성**: iteration별 JSON Lines 로그(`observability.py`) + 후보/Pareto front 이동을 보여주는 HTML 대시보드(`tools/dashboard.py`)
+- **GPU 자동 감지**: `tools/qat.py`가 CUDA → Apple MPS → CPU 순으로 자동 감지 (`AUTOCIM_QAT_DEVICE`로 override 가능)
+- **병렬 워밍업**: LHS 워밍업 후보들은 서로 독립적이므로, `--parallel-warmup-workers`로 스레드 풀에서 동시 평가 가능 (`tools/batch_warmup.py`)
 
 ## 설치
 
@@ -48,12 +50,19 @@ graph TD
 pip install -r requirements.txt
 ```
 
-CPU 전용 환경이라면 torch/torchvision을 CPU wheel로 먼저 설치해 다운로드 용량을 줄일 수 있습니다:
+`torch`/`torchvision`은 버전만 고정돼 있고 실제 wheel(CPU 전용 vs CUDA)은 어느 index에서 설치하느냐로 결정됩니다:
 
 ```bash
+# CPU 전용 (다운로드 용량 최소화 -- CI/Docker가 이 방식 사용)
 pip install torch==2.13.0 torchvision==0.28.0 --index-url https://download.pytorch.org/whl/cpu
 pip install -r requirements.txt
+
+# GPU(CUDA) 사용 -- 드라이버가 지원하는 CUDA 버전에 맞는 index 선택
+pip install torch==2.13.0 torchvision==0.28.0 --index-url https://download.pytorch.org/whl/cu130
+pip install -r requirements.txt
 ```
+
+설치 후 `python -c "import torch; print(torch.cuda.is_available())"`로 GPU 인식 여부를 확인할 수 있습니다.
 
 ## 실행
 
@@ -76,6 +85,8 @@ python main.py --model-id resnet18 --dashboard-out report.html
 
 Groq/Gemini를 쓰려면 `pip install -r requirements.txt`에 이미 포함된 `langchain-groq`/`langchain-google-genai`가 필요하고, 각각 `GROQ_API_KEY`/`GOOGLE_API_KEY` 환경변수를 설정하면 됩니다.
 
+> **GPU + `--parallel-warmup-workers` 병용 시 주의**: GPU가 하나뿐이면 워밍업 후보들이 전부 같은 GPU 메모리를 동시에 두고 경쟁합니다. OOM이 나면 `--parallel-warmup-workers`를 낮추거나, 이 단계만 `AUTOCIM_QAT_DEVICE=cpu`로 강제하세요.
+
 주요 CLI 옵션 (`main.py`):
 
 | 옵션 | 설명 |
@@ -86,6 +97,7 @@ Groq/Gemini를 쓰려면 `pip install -r requirements.txt`에 이미 포함된 `
 | `--checkpoint-db PATH` | 체크포인트 SQLite 경로 (`:memory:`로 영속성 끄기 가능) |
 | `--dashboard-out PATH` | 세션이 멈추거나 끝날 때마다 HTML 대시보드를 이 경로에 기록 |
 | `--list-sessions` | `--checkpoint-db`에 저장된 모든 세션(thread_id, 상태, iteration_count)을 나열하고 종료 |
+| `--parallel-warmup-workers N` | (opt-in) 새 세션 시작 시 LHS 워밍업 후보들을 순차 그래프 루프 진입 전에 N개 스레드로 동시 평가 (`tools/batch_warmup.py`). 생략 시 기존처럼 순차 실행 |
 
 ### 주요 환경변수
 
@@ -98,6 +110,7 @@ Groq/Gemini를 쓰려면 `pip install -r requirements.txt`에 이미 포함된 `
 | `AUTOCIM_LOG_DIR` | 구조화 로그(JSONL) 저장 위치 (기본 `.cache/logs/`) |
 | `AUTOCIM_QAT_TRAIN_SIZE` / `_VAL_SIZE` / `_TEST_SIZE` / `_BATCH_SIZE` | QAT fine-tuning/평가 데이터셋 크기 (기본 512/128/1000/32 — CIFAR10 데모 서브셋). `TRAIN_SIZE`/`TEST_SIZE`는 `full`로 설정하면 해당 split 전체 사용 (wall-clock 증가) |
 | `AUTOCIM_QAT_SEED` | QAT train/val/test 분할 시드 (기본 0) |
+| `AUTOCIM_QAT_DEVICE` | QAT 학습에 사용할 디바이스 (`cuda`, `mps`, `cpu`, `cuda:0` 등). 미설정 시 CUDA → MPS → CPU 순으로 자동 감지 |
 
 ## Docker
 
@@ -120,8 +133,9 @@ pytest
 graph.py, main.py, state.py, llm.py, middleware.py,
 observability.py, store.py   # 코어 오케스트레이션/런타임 (LangGraph 조립, 상태 스키마, LLM 운영, 구조화 로깅)
 nodes/                        # 6개 에이전트 노드 함수
-tools/                        # 백엔드 시뮬레이터 (QAT, 물리 시뮬레이션, 탐색 알고리즘, 대시보드)
+tools/                        # 백엔드 시뮬레이터 (QAT, 물리 시뮬레이션, 탐색 알고리즘, 병렬 워밍업, 대시보드)
 schemas/                      # Pydantic 입출력 스키마
 tests/                        # pytest 스위트 (전부 stub 기반)
 docs/                         # 연구 계획서 등 부가 문서
+examples/hw_configs/          # --hw-config 예시 JSON
 ```
