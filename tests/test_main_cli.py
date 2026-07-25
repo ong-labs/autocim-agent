@@ -6,6 +6,11 @@ non-code-reading researcher can't act on.
 Also main.py's --list-sessions (list_sessions/print_sessions): a
 researcher shouldn't have to remember thread_ids manually to see what's
 persisted in a checkpoint DB.
+
+Also main.py's .env/.env.local auto-loading: a silent regression here
+(e.g. someone drops the load_dotenv() calls) wouldn't be caught by any
+other test, since it's the one piece of startup behavior that only
+main() itself exercises.
 """
 
 import json
@@ -13,6 +18,7 @@ import json
 import pytest
 from langgraph.checkpoint.sqlite import SqliteSaver
 
+import main
 from main import DEFAULT_HW_CONFIG, HWConfigError, list_sessions, load_hw_config, print_sessions, run_session
 
 
@@ -164,3 +170,26 @@ def test_run_session_without_the_flag_keeps_todays_sequential_behavior(tmp_path,
 
     assert sessions[0]["is_converged"] is True
     assert sessions[0]["iteration_count"] == 1  # good_hw_config converges on the very first real iteration
+
+
+# --- .env/.env.local auto-loading ---------------------------------------------
+
+
+def test_main_loads_dotenv_then_dotenv_local_with_override(monkeypatch, tmp_path):
+    """main() must load plain .env first (no override -- real shell-exported
+    vars still win) and then .env.local second with override=True (personal
+    secrets take priority over shared .env defaults) -- not just call
+    load_dotenv() once, and not in the opposite order."""
+    calls = []
+    monkeypatch.setattr(main, "load_dotenv", lambda *args, **kwargs: calls.append((args, kwargs)))
+    monkeypatch.setattr(
+        "sys.argv", ["main.py", "--list-sessions", "--checkpoint-db", str(tmp_path / "checkpoints.sqlite")]
+    )
+
+    main.main()
+
+    assert len(calls) == 2
+    first_args, first_kwargs = calls[0]
+    second_args, second_kwargs = calls[1]
+    assert first_args == () and not first_kwargs.get("override")  # plain .env, no override
+    assert second_args == (".env.local",) and second_kwargs.get("override") is True
