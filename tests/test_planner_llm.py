@@ -60,9 +60,9 @@ def test_planner_falls_back_to_search_point_when_llm_call_raises(monkeypatch, st
     # Same search machinery planner_node itself calls -- verifies the
     # fallback actually uses the (deterministic) per-stage LHS/surrogate
     # search points, rather than a flat hardcoded default.
-    stage_names = planner_module._real_stage_names(state["model_id"])
+    stage_names = planner_module.real_stage_names(state["model_id"])
     stage_points, search_tag = planner_module._propose_stage_points(state, stage_names)
-    expected_layer_configs = planner_module._points_to_stage_configs(stage_points, stage_names)
+    expected_layer_configs = planner_module.points_to_stage_configs(stage_points, stage_names)
 
     update = planner_node(state)
 
