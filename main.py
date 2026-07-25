@@ -127,6 +127,33 @@ def parse_args() -> argparse.Namespace:
             "fully-sequential behavior."
         ),
     )
+    parser.add_argument(
+        "--target-accuracy",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help=(
+            "Optional convergence gate (nodes/evaluator.py): a candidate must reach "
+            "at least this accuracy (in addition to @verifier's own IR-drop/noise "
+            "check) to count as converged, or it's treated as a non-convergent "
+            "iteration (same MAX_RETRY_LIMIT -> HITL flow as any other failure). "
+            "Omit to leave accuracy ungated, as before this option existed."
+        ),
+    )
+    parser.add_argument(
+        "--target-energy-pj",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help="Optional convergence gate: a candidate's energy_pj must be at or below this value. Omit to leave ungated.",
+    )
+    parser.add_argument(
+        "--target-latency-ms",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help="Optional convergence gate: a candidate's noc_latency_ms must be at or below this value. Omit to leave ungated.",
+    )
     return parser.parse_args()
 
 
@@ -157,7 +184,13 @@ def load_hw_config(path: Optional[str]) -> HWConfig:
         ) from None
 
 
-def build_initial_state(model_id: str, hw_config: HWConfig) -> AutoCIMState:
+def build_initial_state(
+    model_id: str,
+    hw_config: HWConfig,
+    target_accuracy: Optional[float] = None,
+    target_energy_pj: Optional[float] = None,
+    target_latency_ms: Optional[float] = None,
+) -> AutoCIMState:
     return {
         "messages": [],
         "failure_history": [],
@@ -178,6 +211,9 @@ def build_initial_state(model_id: str, hw_config: HWConfig) -> AutoCIMState:
         "planned_layer_configs": [],
         "model_id": model_id,
         "hw_spec_id": hw_config.hw_spec_id,
+        "target_accuracy": target_accuracy,
+        "target_energy_pj": target_energy_pj,
+        "target_latency_ms": target_latency_ms,
         "iteration_count": 0,
         "retry_count": 0,
         "is_converged": False,
@@ -312,6 +348,9 @@ def run_session(
     checkpointer,
     dashboard_out: Optional[str] = None,
     parallel_warmup_workers: Optional[int] = None,
+    target_accuracy: Optional[float] = None,
+    target_energy_pj: Optional[float] = None,
+    target_latency_ms: Optional[float] = None,
 ) -> None:
     register_hw_config(hw_config)
     graph = build_graph(checkpointer=checkpointer)
@@ -350,7 +389,9 @@ def run_session(
             f"\nStarting new AutoCIM-Agent session: model_id={model_id!r} "
             f"hw_spec_id={hw_config.hw_spec_id!r} thread_id={thread_id!r}"
         )
-        resumable_input = build_initial_state(model_id, hw_config)
+        resumable_input = build_initial_state(
+            model_id, hw_config, target_accuracy, target_energy_pj, target_latency_ms
+        )
 
         if parallel_warmup_workers is not None:
             # Fresh session only -- a resumed/paused session already has
@@ -427,6 +468,9 @@ def main() -> None:
             checkpointer,
             dashboard_out=args.dashboard_out,
             parallel_warmup_workers=args.parallel_warmup_workers,
+            target_accuracy=args.target_accuracy,
+            target_energy_pj=args.target_energy_pj,
+            target_latency_ms=args.target_latency_ms,
         )
 
 
