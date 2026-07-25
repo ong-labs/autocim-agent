@@ -4,13 +4,13 @@ Research_Plan.md 2/3 attribute surrogate-model construction (BO/NSGA-II
 normalization, LHS sampling) and history-based search-bound updates to
 @planner. `tools/search.py` implements the real (if minimal-dependency)
 version of that: real n-dimensional Latin Hypercube Sampling for the first
-`_warmup_count(n_stages)` iterations, then an IDW-surrogate + random-search
+`warmup_count(n_stages)` iterations, then an IDW-surrogate + random-search
 UCB acquisition once real `candidate_history` (state.py, populated by
 @evaluator) exists -- one independent (weight_bits, column_pruning_ratio)
 pair *per real model stage* (`tools.qat.get_layer_groups`), not a single
 flat point fanned out via a fixed rule: the search space is genuinely
 `2 * len(stage_names)`-dimensional (12 for resnet18's 6 stages, up to 40 for
-mobilenet_v2's 20). `_points_to_stage_configs` only rounds/clamps each
+mobilenet_v2's 20). `points_to_stage_configs` only rounds/clamps each
 stage's searched point into a `LayerBitConfig` -- it introduces no bias of
 its own; whatever differences exist between stages come from the search
 itself finding them independently, not from a hardcoded edge-stage rule.
@@ -68,7 +68,7 @@ _TOOL_NAME = PlannerLayerDecision.__name__
 # 12-40-dimensional search space (curse of dimensionality), but scaling
 # unboundedly (e.g. the textbook ~10x-dimensions BO heuristic) would mean
 # hundreds of real QAT trials at 37s-2min each before the surrogate phase
-# even starts. `_warmup_count` is the deliberate middle ground: at least
+# even starts. `warmup_count` is the deliberate middle ground: at least
 # one warm-up sample per stage, capped at `_MAX_WARMUP_CANDIDATES` so a
 # 20-stage model (mobilenet_v2) still bounds warm-up wall-clock instead of
 # scaling with model size.
@@ -78,8 +78,22 @@ _WEIGHT_BITS_MIN = 2
 _PRUNING_RATIO_MAX = 0.5
 
 
-def _warmup_count(n_stages: int) -> int:
+def warmup_count(n_stages: int) -> int:
     return min(_MAX_WARMUP_CANDIDATES, max(_WARMUP_CANDIDATES, n_stages))
+
+
+def search_seed_for(model_id: str, hw_spec_id: str) -> int:
+    """Deterministic per-`(model_id, hw_spec_id)` seed for LHS warm-up
+    sampling -- crc32, not Python's builtin `hash()`, since str hashing is
+    randomized per-process (`PYTHONHASHSEED`) unless disabled, which would
+    make "same warm-up index -> same point" false across runs/processes.
+    Public (not just inlined in `_propose_stage_points`) so
+    `tools/batch_warmup.py`'s parallel warm-up runner derives the exact
+    same seed the sequential path would have used for this
+    `(model_id, hw_spec_id)` -- computing all warm-up points up front must
+    reproduce, not diverge from, what `_propose_stage_points` would have
+    produced one at a time."""
+    return zlib.crc32(f"{model_id}::{hw_spec_id}".encode())
 
 
 _SYSTEM_PROMPT = (
@@ -101,7 +115,7 @@ _SYSTEM_PROMPT = (
 )
 
 
-def _search_bounds(hw_spec_id: str) -> Tuple[Bounds, Bounds]:
+def search_bounds(hw_spec_id: str) -> Tuple[Bounds, Bounds]:
     try:
         hw = get_hw_config(hw_spec_id)
         bits_max = min(8, hw.adc_bits, hw.dac_bits)
@@ -111,7 +125,7 @@ def _search_bounds(hw_spec_id: str) -> Tuple[Bounds, Bounds]:
     return (_WEIGHT_BITS_MIN, bits_max), (0.0, _PRUNING_RATIO_MAX)
 
 
-def _real_stage_names(model_id: str) -> List[str]:
+def real_stage_names(model_id: str) -> List[str]:
     """Real per-stage layer names for `model_id` (tools/qat.py), in true
     front-to-back architectural order -- `group_quantizable_layers` builds
     its dict while iterating `model.named_modules()`, which visits stages in
@@ -132,16 +146,10 @@ def _propose_stage_points(state: AutoCIMState, stage_names: List[str]) -> Tuple[
     """Returns one (weight_bits, column_pruning_ratio) point per real stage
     (in `stage_names` order) and a short tag describing which search phase
     produced it, for the LLM prompt/messages."""
-    bit_bounds, pruning_bounds = _search_bounds(state["hw_spec_id"])
+    bit_bounds, pruning_bounds = search_bounds(state["hw_spec_id"])
     history = state.get("candidate_history", [])
-    n_warmup = _warmup_count(len(stage_names))
-    # Deterministic per (model_id, hw_spec_id): re-deriving the LHS warm-up
-    # set from a stable seed avoids needing a separate cursor field in
-    # AutoCIMState to track "which warm-up index are we on". crc32, not
-    # Python's builtin hash() -- str hashing is randomized per-process
-    # (PYTHONHASHSEED) unless disabled, which would make the "same warm-up
-    # index -> same point" guarantee this comment promises false across runs.
-    seed = zlib.crc32(f"{state['model_id']}::{state['hw_spec_id']}".encode())
+    n_warmup = warmup_count(len(stage_names))
+    seed = search_seed_for(state["model_id"], state["hw_spec_id"])
 
     if len(history) < n_warmup:
         point = warmup_stage_candidate(len(history), n_warmup, len(stage_names), bit_bounds, pruning_bounds, seed)
@@ -150,7 +158,7 @@ def _propose_stage_points(state: AutoCIMState, stage_names: List[str]) -> Tuple[
     return point, f"surrogate-model acquisition over {len(history)} prior candidates"
 
 
-def _points_to_stage_configs(stage_points: StagePoint, stage_names: List[str]) -> List[LayerBitConfig]:
+def points_to_stage_configs(stage_points: StagePoint, stage_names: List[str]) -> List[LayerBitConfig]:
     """One `LayerBitConfig` per real stage: each stage's own independently
     searched (weight_bits, column_pruning_ratio) point, just rounded/clamped
     to valid values -- no per-stage bias is applied here, since the search
@@ -274,9 +282,9 @@ def planner_node(state: AutoCIMState) -> Dict[str, Any]:
             }
         )
 
-    stage_names = _real_stage_names(state["model_id"])
+    stage_names = real_stage_names(state["model_id"])
     stage_points, search_tag = _propose_stage_points(state, stage_names)
-    stage_configs = _points_to_stage_configs(stage_points, stage_names)
+    stage_configs = points_to_stage_configs(stage_points, stage_names)
 
     budget_status = check_budget(state.get("llm_usage", []))
     if budget_status.exceeded:
