@@ -32,4 +32,8 @@ langchain-anthropic==1.5.2
 # point AUTOCIM_PLANNER_MODEL at either.
 langchain-groq==1.1.3
 langchain-google-genai==4.3.1
+# main.py loads .env/.env.local at startup (never at import time -- see its
+# own comment) so AUTOCIM_PLANNER_MODEL/API keys don't need re-exporting in
+# every new shell. Both files are gitignored; only .env.example is tracked.
+python-dotenv==1.2.1
 pytest==9.1.1
