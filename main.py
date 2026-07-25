@@ -31,6 +31,7 @@ from graph import build_graph
 from middleware import register_hw_config
 from schemas.config import HWConfig, NoCTopology
 from state import AutoCIMState
+from tools.batch_warmup import run_parallel_warmup
 from tools.calibration import bootstrap_calibration_factors, bootstrap_calibration_provenance
 from tools.dashboard import render_dashboard_html
 
@@ -101,6 +102,19 @@ def parse_args() -> argparse.Namespace:
             "List every thread_id found in --checkpoint-db (status, iteration_count, "
             "model_id/hw_spec_id) and exit -- a researcher otherwise has to remember "
             "thread_ids manually to resume/inspect a past session."
+        ),
+    )
+    parser.add_argument(
+        "--parallel-warmup-workers",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Opt-in: evaluate the LHS warm-up candidates (tools/batch_warmup.py) "
+            "concurrently across N threads before the sequential graph loop starts, "
+            "instead of one real QAT trial per graph iteration. Only applies to a "
+            "brand-new session (not a resumed/paused one). Omit to keep today's "
+            "fully-sequential behavior."
         ),
     )
     return parser.parse_args()
@@ -282,7 +296,12 @@ def write_dashboard(graph, config: Dict[str, Any], dashboard_out: Optional[str])
 
 
 def run_session(
-    model_id: str, hw_config: HWConfig, thread_id: str, checkpointer, dashboard_out: Optional[str] = None
+    model_id: str,
+    hw_config: HWConfig,
+    thread_id: str,
+    checkpointer,
+    dashboard_out: Optional[str] = None,
+    parallel_warmup_workers: Optional[int] = None,
 ) -> None:
     register_hw_config(hw_config)
     graph = build_graph(checkpointer=checkpointer)
@@ -322,6 +341,25 @@ def run_session(
             f"hw_spec_id={hw_config.hw_spec_id!r} thread_id={thread_id!r}"
         )
         resumable_input = build_initial_state(model_id, hw_config)
+
+        if parallel_warmup_workers is not None:
+            # Fresh session only -- a resumed/paused session already has
+            # whatever candidate_history it persisted, and this step's
+            # whole point is seeding history *before* the first real
+            # iteration (tools/batch_warmup.py's module docstring).
+            print(f"Evaluating LHS warm-up candidates across up to {parallel_warmup_workers} worker(s)...")
+            warmup_candidates, warmup_failures = run_parallel_warmup(
+                model_id,
+                hw_config,
+                calibration_factors=resumable_input["calibration_factors"],
+                max_workers=parallel_warmup_workers,
+            )
+            resumable_input["candidate_history"] = warmup_candidates
+            resumable_input["failure_history"] = warmup_failures
+            print(
+                f"Parallel warm-up done: {len(warmup_candidates)} candidate(s) recorded, "
+                f"{len(warmup_failures)} failure(s)."
+            )
 
     while True:
         interrupt_payload = stream_until_interrupt(graph, resumable_input, config)
@@ -369,7 +407,14 @@ def main() -> None:
     thread_id = args.thread_id or str(uuid.uuid4())
 
     with SqliteSaver.from_conn_string(checkpoint_db) as checkpointer:
-        run_session(args.model_id, hw_config, thread_id, checkpointer, dashboard_out=args.dashboard_out)
+        run_session(
+            args.model_id,
+            hw_config,
+            thread_id,
+            checkpointer,
+            dashboard_out=args.dashboard_out,
+            parallel_warmup_workers=args.parallel_warmup_workers,
+        )
 
 
 if __name__ == "__main__":
