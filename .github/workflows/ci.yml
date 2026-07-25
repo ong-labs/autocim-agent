@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: "pip"
+
+      # torch/torchvision from PyPI's default index pull in CUDA wheels
+      # (multi-GB, unneeded -- tools/qat.py's own docstring states this
+      # project's CPU-only scope). Installed first at the exact pinned
+      # version from requirements.txt so the later full install is a no-op
+      # for these two packages instead of re-downloading the CUDA build.
+      - name: Install CPU-only torch/torchvision
+        run: pip install torch==2.13.0 torchvision==0.28.0 --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        run: pytest -q

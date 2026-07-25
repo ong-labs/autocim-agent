@@ -1,0 +1,22 @@
+# Runtime artifacts: checkpoint DBs, downloaded CIFAR10/pretrained weights,
+# observability.py's structured logs -- all regenerated locally, never
+# something to commit (the CIFAR10 cache alone is ~340MB).
+.cache/
+scratch_qat_test/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Local-only Claude Code settings (permissions/tool config specific to one
+# machine) -- a shared .claude/settings.json, if one is ever added, stays
+# tracked.
+.claude/settings.local.json
+
+# OS junk
+.DS_Store
+Thumbs.db

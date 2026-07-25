@@ -1,0 +1,8 @@
+.cache/
+.git/
+.pytest_cache/
+__pycache__/
+**/__pycache__/
+*.pyc
+.claude/
+scratch_qat_test/
