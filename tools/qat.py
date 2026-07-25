@@ -19,7 +19,14 @@ stages, or names none at all (e.g. `@tuner`'s own single-entry fallback,
 nodes/common.py's `default_layer_configs`), still degrades gracefully to
 uniform quantization rather than erroring.
 
-Scope, stated plainly (CPU-only, no GPU in this environment):
+Scope, stated plainly:
+- Device-agnostic: `run_qat_tuning` moves its (deep-copied, per-trial)
+  model and each batch to `_resolve_device`'s result -- an explicit
+  `AUTOCIM_QAT_DEVICE` override, else auto-detected (CUDA, then Apple
+  MPS, then CPU) -- never hardcoded to assume a GPU exists, since most
+  CI/dev machines don't (CLAUDE.md 5.C). `get_qat_backend`'s cached
+  `base_model`/loaders stay on CPU regardless -- only the per-trial deep
+  copy moves, so the shared cache is never pinned to one device.
 - `_MODEL_REGISTRY` has three entries: "resnet18" (torchvision, CNN),
   "mobilenet_v2" (torchvision, depthwise-separable CNN), and "vit_tiny"
   (timm's `vit_tiny_patch16_224`, transformer) -- all ImageNet-pretrained,
@@ -207,13 +214,40 @@ def apply_crossbar_quant_prune(
 
 
 # ---------------------------------------------------------------------------
+# Device selection (CLAUDE.md 5.C: config-driven, never hardcoded)
+# ---------------------------------------------------------------------------
+
+_DEVICE_ENV = "AUTOCIM_QAT_DEVICE"
+
+
+def _resolve_device(requested: Optional[str] = None) -> torch.device:
+    """`requested` (or `AUTOCIM_QAT_DEVICE` if `requested` is None) wins
+    when set; otherwise auto-detects the best available accelerator --
+    CUDA, then Apple's MPS backend, then CPU. Never raises on a machine
+    with no GPU (that's the common case: CI, most dev/deployment
+    machines) -- silently resolves to CPU rather than requiring every
+    caller to know whether a GPU exists."""
+    candidate = requested if requested is not None else os.environ.get(_DEVICE_ENV)
+    if candidate:
+        return torch.device(candidate)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+# ---------------------------------------------------------------------------
 # Fine-tuning + evaluation loop
 # ---------------------------------------------------------------------------
 
 
-def _train_one_epoch(model: nn.Module, loader: DataLoader, optimizer: torch.optim.Optimizer, criterion) -> None:
+def _train_one_epoch(
+    model: nn.Module, loader: DataLoader, optimizer: torch.optim.Optimizer, criterion, device: torch.device
+) -> None:
     model.train()
     for images, labels in loader:
+        images, labels = images.to(device), labels.to(device)
         optimizer.zero_grad()
         loss = criterion(model(images), labels)
         loss.backward()
@@ -221,10 +255,11 @@ def _train_one_epoch(model: nn.Module, loader: DataLoader, optimizer: torch.opti
 
 
 @torch.no_grad()
-def _evaluate(model: nn.Module, loader: DataLoader, criterion) -> Dict[str, float]:
+def _evaluate(model: nn.Module, loader: DataLoader, criterion, device: torch.device) -> Dict[str, float]:
     model.eval()
     correct, total, loss_sum = 0, 0, 0.0
     for images, labels in loader:
+        images, labels = images.to(device), labels.to(device)
         outputs = model(images)
         loss_sum += criterion(outputs, labels).item() * labels.size(0)
         correct += (outputs.argmax(dim=1) == labels).sum().item()
@@ -238,10 +273,13 @@ def run_qat_tuning(
     default_config: StageConfig,
     max_epochs: int,
     early_stopping_patience: Optional[int] = None,
+    device: Optional[str] = None,
 ) -> Dict[str, float]:
     """Real QAT trial for one candidate config: deep-copies `backend`'s base
     model (so each candidate starts from the same pretrained weights, never
-    a previous candidate's fine-tuned weights), applies each real stage's
+    a previous candidate's fine-tuned weights), moves that copy to
+    `_resolve_device(device)` (`backend.base_model`/loaders themselves stay
+    on CPU -- only this per-trial copy moves), applies each real stage's
     own crossbar-aligned fake-quant + structured pruning (falling back to
     `default_config` for any stage `stage_configs` doesn't cover),
     fine-tunes for up to `max_epochs` real gradient-descent epochs against
@@ -250,7 +288,8 @@ def run_qat_tuning(
     -- touched exactly once, after every training/early-stopping decision is
     already final, so the reported number isn't leaked into those decisions.
     """
-    model = copy.deepcopy(backend.base_model)
+    resolved_device = _resolve_device(device)
+    model = copy.deepcopy(backend.base_model).to(resolved_device)
     apply_crossbar_quant_prune(model, stage_configs, default_config)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
@@ -260,9 +299,9 @@ def run_qat_tuning(
     epochs_without_improvement = 0
     epochs_run = 0
     for epoch in range(max_epochs):
-        _train_one_epoch(model, backend.train_loader, optimizer, criterion)
+        _train_one_epoch(model, backend.train_loader, optimizer, criterion, resolved_device)
         epochs_run = epoch + 1
-        val_metrics = _evaluate(model, backend.val_loader, criterion)
+        val_metrics = _evaluate(model, backend.val_loader, criterion, resolved_device)
         if val_metrics["loss"] < best_val_loss - 1e-4:
             best_val_loss = val_metrics["loss"]
             epochs_without_improvement = 0
@@ -271,8 +310,8 @@ def run_qat_tuning(
         if early_stopping_patience is not None and epochs_without_improvement >= early_stopping_patience:
             break
 
-    final_metrics = _evaluate(model, backend.test_loader, criterion)
-    return {"accuracy": final_metrics["accuracy"], "epochs_run": epochs_run}
+    final_metrics = _evaluate(model, backend.test_loader, criterion, resolved_device)
+    return {"accuracy": final_metrics["accuracy"], "epochs_run": epochs_run, "device": str(resolved_device)}
 
 
 # ---------------------------------------------------------------------------
@@ -351,8 +390,9 @@ def get_layer_groups(model_id: str) -> Dict[str, List[str]]:
 # AUTOCIM_QAT_TRAIN_SIZE/AUTOCIM_QAT_TEST_SIZE request "every image CIFAR10's
 # own split has" without hand-computing 50000/10000 -- resolved against the
 # actual loaded dataset length in `_build_cifar10_loaders`, not guessed here.
-# Widening these multiplies real per-trial wall-clock (CPU-only, no GPU --
-# see this module's docstring); that tradeoff is the caller's to make, not
+# Widening these multiplies real per-trial wall-clock -- much less severely
+# on a machine `_resolve_device` finds a GPU on than on CPU (see this
+# module's docstring), but still the caller's tradeoff to make, not
 # silently defaulted for them.
 _TRAIN_SIZE_ENV = "AUTOCIM_QAT_TRAIN_SIZE"
 _VAL_SIZE_ENV = "AUTOCIM_QAT_VAL_SIZE"
