@@ -29,3 +29,21 @@ jobs:
 
       - name: Run tests
         run: pytest -q
+
+  docker-build:
+    # No Docker available in this project's local dev environment to
+    # verify the Dockerfile builds/runs at all -- ubuntu-latest runners
+    # have Docker preinstalled, so this is the actual verification for it,
+    # run on every push/PR instead of a one-off manual check.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t autocim-agent .
+
+      - name: Smoke test the built image
+        # --help needs no API key/model/network -- just proves the image's
+        # Python env + entrypoint actually run, not only that `docker build`
+        # succeeded.
+        run: docker run --rm autocim-agent --help
