@@ -228,23 +228,81 @@ def prompt_for_override(interrupt_payload: Dict[str, Any]) -> Dict[str, Any]:
     print(f"reason         : {interrupt_payload.get('reason')}")
     print(f"iteration_count: {interrupt_payload.get('iteration_count')}")
     print(f"retry_count    : {interrupt_payload.get('retry_count')}")
-    print(f"failure_history: {interrupt_payload.get('failure_history')}")
-    print(f"latest_metrics : {interrupt_payload.get('latest_metrics')}")
+    for entry in interrupt_payload.get("failure_history") or []:
+        print(f"  - iter {entry.get('iteration')}: {entry.get('reason')}")
+    latest = (interrupt_payload.get("latest_metrics") or {}).get("verifier", {}).get("data") or {}
+    if latest:
+        print(f"latest verifier: {latest}")
 
     raw = input('Enter new_bounds as JSON (e.g. {"weight_bits_min": 2}), or leave blank to retry unchanged: ').strip()
     new_bounds = json.loads(raw) if raw else {}
     return {"new_bounds": new_bounds}
 
 
+def _truncate(text: Optional[str], max_chars: int = 80) -> str:
+    text = text or ""
+    return text if len(text) <= max_chars else text[: max_chars - 3] + "..."
+
+
+def _format_update(iteration: int, node_name: str, update: Dict[str, Any]) -> str:
+    """One human-readable line per graph node update -- the raw update
+    dict (full layer_configs, messages, etc.) is real data but far too
+    dense to watch live; this pulls out just enough to follow progress at
+    a glance. Full detail is still in candidate_history/--dashboard-out/
+    observability.py's JSONL log (AUTOCIM_LOG_STDOUT=1 to also mirror that
+    to stdout) if it's ever needed."""
+    prefix = f"[{iteration}] {node_name:<9}:"
+    data = ((update.get("metrics_store") or {}).get(node_name) or {}).get("data") or {}
+
+    if node_name == "planner":
+        decisions = update.get("planner_decisions") or []
+        if not decisions:
+            return f"{prefix} (no decision recorded)"
+        d = decisions[-1]
+        llm_state = "llm=ok" if d.get("used_llm") else "llm=fallback"
+        return f"{prefix} {d.get('search_tag')} ({llm_state}) -- {_truncate(d.get('rationale'))}"
+
+    if node_name == "tuner":
+        return f"{prefix} accuracy={data.get('accuracy')} device={data.get('device')} epochs_run={data.get('epochs_run')}"
+
+    if node_name == "mapper":
+        return f"{prefix} noc_latency_ms={data.get('noc_latency_ms')} tiles_needed={data.get('tiles_needed')}"
+
+    if node_name == "profiler":
+        return f"{prefix} energy_pj={data.get('energy_pj')}"
+
+    if node_name == "verifier":
+        return (
+            f"{prefix} hw_converged={data.get('is_converged')} "
+            f"ir_drop_error_pct={data.get('ir_drop_error_pct')} noise_margin_db={data.get('noise_margin_db')}"
+        )
+
+    if node_name == "evaluator":
+        if update.get("is_converged"):
+            return f"{prefix} CONVERGED"
+        failure = (update.get("failure_history") or [{}])[0]
+        status = "HITL" if update.get("needs_hitl") else "not converged, retrying"
+        return f"{prefix} {status} (retry {update.get('retry_count')}) -- {failure.get('reason')}"
+
+    return f"{prefix} {update}"  # fallback for any future node this doesn't special-case yet
+
+
 def stream_until_interrupt(graph, resumable_input: Any, config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Streams node-by-node state deltas to stdout; returns the interrupt
-    payload if the run paused mid-graph, or None if it ran to completion."""
+    """Streams node-by-node state deltas to stdout as one readable summary
+    line per node (`_format_update`); returns the interrupt payload if the
+    run paused mid-graph, or None if it ran to completion. `iteration`
+    tracks the current graph iteration across nodes -- only `planner`'s own
+    update carries `iteration_count` directly, so it's captured there and
+    reused for the rest of that iteration's node lines."""
+    iteration = 0
     for chunk in graph.stream(resumable_input, config=config, stream_mode="updates"):
         for node_name, update in chunk.items():
             if node_name == "__interrupt__":
                 interrupts: tuple[Interrupt, ...] = update
                 return interrupts[0].value
-            print(f"[{node_name}] {update}")
+            if node_name == "planner":
+                iteration = update.get("iteration_count", iteration)
+            print(_format_update(iteration, node_name, update))
     return None
 
 
@@ -263,9 +321,16 @@ def get_pending_interrupt(graph, config: Dict[str, Any]) -> Optional[Dict[str, A
 
 
 def print_final_state(state: Dict[str, Any]) -> None:
-    print(f"is_converged  : {state.get('is_converged')}")
+    print(f"is_converged   : {state.get('is_converged')}")
     print(f"iteration_count: {state.get('iteration_count')}")
-    print(f"metrics_store : {state.get('metrics_store')}")
+    history = state.get("candidate_history") or []
+    if history:
+        latest = history[-1]
+        print(
+            f"latest candidate: accuracy={latest.get('accuracy')} energy_pj={latest.get('energy_pj')} "
+            f"noc_latency_ms={latest.get('noc_latency_ms')} pareto_rank={latest.get('pareto_rank')}"
+        )
+    print("(full detail: --dashboard-out report, or candidate_history/llm_usage in the checkpoint DB)")
 
 
 def list_sessions(checkpointer) -> List[Dict[str, Any]]:
