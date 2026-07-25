@@ -51,7 +51,7 @@ class TunerToolOutput(ToolResult):
         default=None,
         description=(
             "e.g. {'accuracy': float, 'epochs_run': int, 'model_ref': str, "
-            "'layer_configs': list[dict]} -- accuracy is real measured "
+            "'layer_configs': list[dict], 'device': str} -- accuracy is real measured "
             "post-QAT accuracy (tools/qat.py); layer_configs is the "
             "validated input echoed back so @mapper/@profiler simulate "
             "against the exact configuration @tuner actually used. No "
