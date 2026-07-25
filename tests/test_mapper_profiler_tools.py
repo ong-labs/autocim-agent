@@ -12,6 +12,15 @@ from nodes.tuner import tuner_node
 from tools.simulators import mapper_tool, profiler_tool
 
 
+def test_tuner_node_reports_which_device_it_used(state_factory, registered_hw_config):
+    state = state_factory(hw_spec_id=registered_hw_config.hw_spec_id)
+
+    tuner_result = tuner_node(state)["metrics_store"]["tuner"]
+
+    assert tuner_result["status"] == "SUCCESS"
+    assert tuner_result["data"]["device"]  # tools/qat.py's _resolve_device always resolves to something real
+
+
 def test_mapper_node_uses_layer_configs_from_tuner_output(state_factory, registered_hw_config):
     state = state_factory(hw_spec_id=registered_hw_config.hw_spec_id)
     state["metrics_store"] = tuner_node(state)["metrics_store"]
