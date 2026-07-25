@@ -6,3 +6,15 @@ __pycache__/
 *.pyc
 .claude/
 scratch_qat_test/
+
+# Secrets: COPY . . would otherwise bake a real .env.local (API keys) or any
+# other stray credential file straight into the image -- mirrors
+# .gitignore's own exclusions here, since the risk is the same shape.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+logs/
+*.log
+*.jsonl
