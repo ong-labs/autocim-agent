@@ -125,3 +125,42 @@ def test_print_sessions_shows_status_per_session(capsys):
     out = capsys.readouterr().out
     assert "t1" in out and "converged" in out
     assert "t2" in out and "paused (HITL)" in out
+
+
+# --- --parallel-warmup-workers -------------------------------------------------
+
+
+def test_run_session_seeds_candidate_history_from_parallel_warmup(tmp_path, registered_hw_config):
+    from nodes.planner import real_stage_names, warmup_count
+    from graph import build_graph
+
+    n_stages = len(real_stage_names("resnet18"))
+    db_path = str(tmp_path / "checkpoints.sqlite")
+    config = {"configurable": {"thread_id": "thread-warmup"}}
+    with SqliteSaver.from_conn_string(db_path) as checkpointer:
+        run_session("resnet18", registered_hw_config, "thread-warmup", checkpointer, parallel_warmup_workers=2)
+        final_state = build_graph(checkpointer=checkpointer).get_state(config).values
+
+    # good_hw_config converges on the very first *sequential* iteration
+    # (iteration_count == 1, unaffected by warm-up -- planner_node's own
+    # counter), but candidate_history must contain every parallel warm-up
+    # candidate *plus* that one real sequential candidate (the known
+    # limitation documented in tools/batch_warmup.py: warm-up doesn't
+    # short-circuit early even though one of its own candidates already
+    # converged).
+    assert final_state["is_converged"] is True
+    assert final_state["iteration_count"] == 1
+    assert len(final_state["candidate_history"]) == warmup_count(n_stages) + 1
+
+
+def test_run_session_without_the_flag_keeps_todays_sequential_behavior(tmp_path, registered_hw_config):
+    """Omitting --parallel-warmup-workers must not change anything --
+    candidate_history should accumulate one entry per real graph iteration,
+    exactly as before this feature existed."""
+    db_path = str(tmp_path / "checkpoints.sqlite")
+    with SqliteSaver.from_conn_string(db_path) as checkpointer:
+        run_session("resnet18", registered_hw_config, "thread-sequential", checkpointer)
+        sessions = list_sessions(checkpointer)
+
+    assert sessions[0]["is_converged"] is True
+    assert sessions[0]["iteration_count"] == 1  # good_hw_config converges on the very first real iteration
