@@ -113,6 +113,11 @@ Groq/Gemini를 쓰려면 `pip install -r requirements.txt`에 이미 포함된 `
 | `--dashboard-out PATH` | 세션이 멈추거나 끝날 때마다 HTML 대시보드를 이 경로에 기록 |
 | `--list-sessions` | `--checkpoint-db`에 저장된 모든 세션(thread_id, 상태, iteration_count)을 나열하고 종료 |
 | `--parallel-warmup-workers N` | (opt-in) 새 세션 시작 시 LHS 워밍업 후보들을 순차 그래프 루프 진입 전에 N개 스레드로 동시 평가 (`tools/batch_warmup.py`). 생략 시 기존처럼 순차 실행 |
+| `--target-accuracy FLOAT` | (opt-in) 이 정확도 이상이어야 "수렴(Converged)"으로 인정 -- `@verifier`의 IR-drop/노이즈 검사만으로는 실제 정확도가 낮아도 수렴 처리될 수 있어서 추가된 게이트. 생략 시 기존처럼 정확도는 게이트하지 않음 (`nodes/evaluator.py`) |
+| `--target-energy-pj FLOAT` | (opt-in) 이 값 이하여야 수렴으로 인정 |
+| `--target-latency-ms FLOAT` | (opt-in) 이 값 이하여야 수렴으로 인정 |
+
+> **`--target-*` 미달 시 동작**: 기존 `MAX_RETRY_LIMIT`(3회) 재시도 → HITL 흐름을 그대로 재사용합니다. 목표 미달 후보도 `candidate_history`에는 정상 기록됩니다(surrogate 학습에 유효한 데이터이므로) -- 다만 `is_converged=False`로 남아 재탐색을 계속 유도합니다.
 
 ### 주요 환경변수
 
