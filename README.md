@@ -131,8 +131,19 @@ Groq/Gemini를 쓰려면 `pip install -r requirements.txt`에 이미 포함된 `
 
 ```bash
 docker build -t autocim-agent .
-docker run --rm -e AUTOCIM_PLANNER_MODEL=... -e ANTHROPIC_API_KEY=... autocim-agent --model-id resnet18
 ```
+
+`.cache/`(체크포인트 DB, 다운로드된 모델 가중치/CIFAR10)를 마운트하지 않으면 `--rm`으로 컨테이너가 사라질 때 전부 같이 사라집니다 -- 매 실행마다 다시 다운로드하고, `--thread-id` 세션 재개도 안 됩니다. `--dashboard-out`으로 쓰는 파일도 마찬가지로 마운트해야 컨테이너 밖에서 열어볼 수 있습니다:
+
+```bash
+docker run --rm \
+  --env-file .env.local \
+  -v "$(pwd)/.cache:/app/.cache" \
+  -v "$(pwd)/report.html:/app/report.html" \
+  autocim-agent --model-id resnet18 --dashboard-out report.html
+```
+
+(`--env-file .env.local`은 `-e AUTOCIM_PLANNER_MODEL=... -e ANTHROPIC_API_KEY=...`를 하나씩 나열하는 대신 `.env.local` 내용을 그대로 전달합니다.)
 
 ## 테스트
 
