@@ -17,10 +17,14 @@ RUN pip install --no-cache-dir torch==2.13.0 torchvision==0.28.0 --index-url htt
 
 COPY . .
 
-# AUTOCIM_PLANNER_MODEL (required by llm.py) and the matching provider API
-# key (ANTHROPIC_API_KEY / OPENAI_API_KEY / GROQ_API_KEY / GOOGLE_API_KEY --
-# see README.md's verified-provider table) are deliberately not set here --
-# pass them at `docker run` time (-e), never bake credentials into an image.
+# llm.py defaults AUTOCIM_PLANNER_MODEL to a local Ollama model
+# ("ollama:qwen2.5:7b"), which this container can't reach at its default
+# localhost:11434 -- either point it at the host's Ollama (-e
+# OLLAMA_HOST=http://host.docker.internal:11434) or override
+# AUTOCIM_PLANNER_MODEL to a cloud provider spec plus its matching API key
+# (ANTHROPIC_API_KEY / OPENAI_API_KEY / GROQ_API_KEY / GOOGLE_API_KEY -- see
+# README.md's verified-provider table). Deliberately not set here -- pass
+# these at `docker run` time (-e), never bake credentials into an image.
 # .dockerignore excludes .env/.env.local, so COPY . . above can't leak them
 # in as a file either.
 ENTRYPOINT ["python", "main.py"]
