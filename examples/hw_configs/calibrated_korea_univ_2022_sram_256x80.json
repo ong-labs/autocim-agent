@@ -1,0 +1,13 @@
+{
+  "hw_spec_id": "calibrated_korea_univ_2022_sram_256x80",
+  "crossbar_rows": 256,
+  "crossbar_cols": 80,
+  "num_tiles": 16,
+  "adc_bits": 4,
+  "dac_bits": 8,
+  "noc_topology": "mesh",
+  "noc_link_bandwidth_gbps": 10.0,
+  "wire_resistance_ohm_per_um": 0.05,
+  "device_noise_sigma": 0.05,
+  "sram_buffer_kb": 64.0
+}
