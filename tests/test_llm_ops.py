@@ -10,7 +10,31 @@ exposing only `.invoke(messages)`, and `sleep_fn` is always a no-op so
 
 import pytest
 
-from llm import LLMCallFailed, check_budget, invoke_with_retry
+import llm
+from llm import LLMCallFailed, check_budget, get_planner_chat_model, invoke_with_retry
+
+
+def test_get_planner_chat_model_defaults_to_local_ollama_when_env_unset(monkeypatch):
+    monkeypatch.delenv("AUTOCIM_PLANNER_MODEL", raising=False)
+    captured = {}
+    monkeypatch.setattr(
+        llm, "init_chat_model", lambda model, **kwargs: captured.update(model=model, kwargs=kwargs) or "fake-model"
+    )
+
+    result = get_planner_chat_model()
+
+    assert captured["model"] == "ollama:qwen2.5:7b"
+    assert result == "fake-model"
+
+
+def test_get_planner_chat_model_respects_env_override(monkeypatch):
+    monkeypatch.setenv("AUTOCIM_PLANNER_MODEL", "anthropic:claude-sonnet-4-5-20250929")
+    captured = {}
+    monkeypatch.setattr(llm, "init_chat_model", lambda model, **kwargs: captured.update(model=model) or "fake-model")
+
+    get_planner_chat_model()
+
+    assert captured["model"] == "anthropic:claude-sonnet-4-5-20250929"
 
 
 class _FailNTimesThenSucceed:
