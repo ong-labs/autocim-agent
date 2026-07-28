@@ -39,7 +39,7 @@ would erase that counter every time evaluator increments it, so
 """
 
 import zlib
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -117,14 +117,40 @@ _SYSTEM_PROMPT = (
 )
 
 
-def search_bounds(hw_spec_id: str) -> Tuple[Bounds, Bounds]:
+def _clamp_bounds(lo: float, hi: float, override_lo: Any, override_hi: Any) -> Bounds:
+    """Narrows (lo, hi) using override_lo/override_hi if they are numeric --
+    never widens past the hw-derived bound, and if a bad pair would invert
+    the range (lo > hi), ignores the override entirely and falls back to
+    the original (lo, hi) rather than producing an unusable search range."""
+    new_lo = max(lo, override_lo) if isinstance(override_lo, (int, float)) else lo
+    new_hi = min(hi, override_hi) if isinstance(override_hi, (int, float)) else hi
+    if new_lo > new_hi:
+        return lo, hi
+    return new_lo, new_hi
+
+
+def search_bounds(hw_spec_id: str, overrides: Optional[Dict[str, Any]] = None) -> Tuple[Bounds, Bounds]:
+    """`overrides` (from `human_overrides`/HITL `new_bounds`) is applied here
+    as a hard clamp on the actual search range -- not just advisory text in
+    the LLM prompt (`_build_user_prompt`'s `researcher_overrides` line still
+    shows it too, but that alone never guaranteed compliance, especially
+    from smaller/local tool-calling models). Recognized keys: weight_bits_min,
+    weight_bits_max, pruning_ratio_min, pruning_ratio_max -- all optional,
+    and each can only narrow its dimension's hw-derived bound, never exceed
+    the physical adc_bits/dac_bits-derived ceiling."""
     try:
         hw = get_hw_config(hw_spec_id)
         bits_max = min(8, hw.adc_bits, hw.dac_bits)
     except Exception:
         bits_max = 8
     bits_max = max(bits_max, _WEIGHT_BITS_MIN + 1)
-    return (_WEIGHT_BITS_MIN, bits_max), (0.0, _PRUNING_RATIO_MAX)
+
+    bit_bounds = (_WEIGHT_BITS_MIN, bits_max)
+    pruning_bounds = (0.0, _PRUNING_RATIO_MAX)
+    if overrides:
+        bit_bounds = _clamp_bounds(*bit_bounds, overrides.get("weight_bits_min"), overrides.get("weight_bits_max"))
+        pruning_bounds = _clamp_bounds(*pruning_bounds, overrides.get("pruning_ratio_min"), overrides.get("pruning_ratio_max"))
+    return bit_bounds, pruning_bounds
 
 
 def real_stage_names(model_id: str) -> List[str]:
@@ -144,11 +170,13 @@ def real_stage_names(model_id: str) -> List[str]:
         return [_FALLBACK_STAGE_NAME]
 
 
-def _propose_stage_points(state: AutoCIMState, stage_names: List[str]) -> Tuple[StagePoint, str]:
+def _propose_stage_points(
+    state: AutoCIMState, stage_names: List[str], overrides: Optional[Dict[str, Any]] = None
+) -> Tuple[StagePoint, str]:
     """Returns one (weight_bits, column_pruning_ratio) point per real stage
     (in `stage_names` order) and a short tag describing which search phase
     produced it, for the LLM prompt/messages."""
-    bit_bounds, pruning_bounds = search_bounds(state["hw_spec_id"])
+    bit_bounds, pruning_bounds = search_bounds(state["hw_spec_id"], overrides)
     history = state.get("candidate_history", [])
     n_warmup = warmup_count(len(stage_names))
     seed = search_seed_for(state["model_id"], state["hw_spec_id"])
@@ -176,6 +204,58 @@ def points_to_stage_configs(stage_points: StagePoint, stage_names: List[str]) ->
             )
         )
     return configs
+
+
+def _clamp_layer_configs(
+    layer_configs: List[LayerBitConfig], overrides: Optional[Dict[str, Any]]
+) -> List[LayerBitConfig]:
+    """Hard-clamps the LLM's (or fallback's) final weight_bits/
+    column_pruning_ratio into `human_overrides` (HITL `new_bounds`) after
+    the fact -- mirrors this module's existing "the LLM is not trusted for
+    [bound] enforcement" policy (module docstring re: HWConfig.adc_bits/
+    dac_bits) applied specifically to human_overrides, since a forced
+    tool-calling response honoring the `researcher_overrides` prompt text
+    was never guaranteed (weaker local/cloud models especially -- see
+    README's provider table).
+
+    Deliberately narrower than `search_bounds()`'s (hw ceiling + override)
+    pair: this only enforces the override values themselves (a no-op when
+    `overrides` is empty, as on every non-HITL iteration), never the
+    hw-derived ceiling on its own -- that stays exclusively @tuner's tool-
+    call validation's job, same as before this function existed (a
+    conflicting/inverted override pair, e.g. min > max, is ignored for that
+    one dimension rather than forced to a nonsensical single value).
+    activation_bits is left untouched: overrides only name weight_bits_min/
+    max, not activation_bits."""
+    if not overrides:
+        return layer_configs
+    bits_lo, bits_hi = overrides.get("weight_bits_min"), overrides.get("weight_bits_max")
+    if isinstance(bits_lo, (int, float)) and isinstance(bits_hi, (int, float)) and bits_lo > bits_hi:
+        bits_lo = bits_hi = None
+    pruning_lo, pruning_hi = overrides.get("pruning_ratio_min"), overrides.get("pruning_ratio_max")
+    if isinstance(pruning_lo, (int, float)) and isinstance(pruning_hi, (int, float)) and pruning_lo > pruning_hi:
+        pruning_lo = pruning_hi = None
+    if bits_lo is None and bits_hi is None and pruning_lo is None and pruning_hi is None:
+        return layer_configs
+
+    clamped = []
+    for lc in layer_configs:
+        weight_bits = lc.weight_bits
+        if isinstance(bits_lo, (int, float)):
+            weight_bits = max(weight_bits, round(bits_lo))
+        if isinstance(bits_hi, (int, float)):
+            weight_bits = min(weight_bits, round(bits_hi))
+        pruning = lc.column_pruning_ratio
+        if isinstance(pruning_lo, (int, float)):
+            pruning = max(pruning, pruning_lo)
+        if isinstance(pruning_hi, (int, float)):
+            pruning = min(pruning, pruning_hi)
+        pruning = round(pruning, 4)
+        if weight_bits == lc.weight_bits and pruning == lc.column_pruning_ratio:
+            clamped.append(lc)
+        else:
+            clamped.append(lc.model_copy(update={"weight_bits": weight_bits, "column_pruning_ratio": pruning}))
+    return clamped
 
 
 def _describe_hw_bounds(hw_spec_id: str) -> str:
@@ -213,7 +293,10 @@ def _build_user_prompt(
         f"latest_verifier_metrics: {verifier_data}",
     ]
     if overrides:
-        lines.append(f"researcher_overrides (apply as guidance this iteration): {overrides}")
+        lines.append(
+            f"researcher_overrides (already applied as hard bounds on per_stage_suggested_candidate above; "
+            f"stay within them): {overrides}"
+        )
     return "\n".join(lines)
 
 
@@ -285,7 +368,7 @@ def planner_node(state: AutoCIMState) -> Dict[str, Any]:
         )
 
     stage_names = real_stage_names(state["model_id"])
-    stage_points, search_tag = _propose_stage_points(state, stage_names)
+    stage_points, search_tag = _propose_stage_points(state, stage_names, overrides)
     stage_configs = points_to_stage_configs(stage_points, stage_names)
 
     budget_status = check_budget(state.get("llm_usage", []))
@@ -328,6 +411,11 @@ def planner_node(state: AutoCIMState) -> Dict[str, Any]:
             rationale = f"LLM proposal failed ({type(exc).__name__}: {exc})"
             messages.append({"role": "system", "content": f"[planner] {rationale}; using the {search_tag} search point directly"})
 
+    # Re-clamped even on the non-LLM fallback paths (a no-op there, since
+    # stage_configs already came from the override-aware bounds above) --
+    # one enforcement point for every path instead of trusting each branch
+    # to have respected overrides on its own.
+    layer_configs = _clamp_layer_configs(layer_configs, overrides)
     layer_config_dicts = [lc.model_dump(mode="json") for lc in layer_configs]
     update["planned_layer_configs"] = layer_config_dicts
     update["llm_usage"] = [usage_record.to_dict()]
