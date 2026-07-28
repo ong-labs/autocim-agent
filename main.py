@@ -29,8 +29,9 @@ import argparse
 import json
 import sys
 import uuid
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 from langgraph.checkpoint.sqlite import SqliteSaver
@@ -42,7 +43,13 @@ from middleware import register_hw_config
 from schemas.config import HWConfig, NoCTopology
 from state import AutoCIMState
 from tools.batch_warmup import run_parallel_warmup
-from tools.calibration import bootstrap_calibration_factors, bootstrap_calibration_provenance
+from tools.calibration import (
+    bootstrap_approximate_calibration_factors,
+    bootstrap_approximate_calibration_provenance,
+    bootstrap_calibration_factors,
+    bootstrap_calibration_provenance,
+    find_nearest_reference,
+)
 from tools.dashboard import render_dashboard_html
 
 # Sample hardware spec, used when --hw-config isn't given. A real deployment
@@ -63,6 +70,7 @@ DEFAULT_HW_CONFIG = HWConfig(
 )
 
 DEFAULT_CHECKPOINT_DB = Path(__file__).resolve().parent / ".cache" / "checkpoints.sqlite"
+EXAMPLE_HW_CONFIGS_DIR = Path(__file__).resolve().parent / "examples" / "hw_configs"
 
 
 def parse_args() -> argparse.Namespace:
@@ -154,6 +162,21 @@ def parse_args() -> argparse.Namespace:
         metavar="FLOAT",
         help="Optional convergence gate: a candidate's noc_latency_ms must be at or below this value. Omit to leave ungated.",
     )
+    parser.add_argument(
+        "--allow-approximate-calibration",
+        action="store_true",
+        help=(
+            "Opt-in: when --hw-config doesn't exactly match a known "
+            "calibration reference (tools/calibration.py's KNOWN_REFERENCES), "
+            "fall back to the nearest reference's scaling-law-transferred "
+            "correction factor instead of leaving @profiler uncalibrated "
+            "(factor 1.0). The result is tagged 'approximate' in "
+            "calibration_provenance, with the matched reference and distance "
+            "printed at session start -- never presented as an exact "
+            "citation. Omit to keep the default: an unmatched hw_config "
+            "stays honestly uncalibrated."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -184,13 +207,250 @@ def load_hw_config(path: Optional[str]) -> HWConfig:
         ) from None
 
 
+# =============================================================================
+# Interactive --hw-config picker (main() only, when --hw-config is omitted
+# and stdin is a real terminal -- a scripted/CI invocation, or one that
+# already passes --hw-config, never hits any of this).
+# =============================================================================
+
+
+_BACK = object()  # sentinel: researcher typed a back-command at a field prompt
+_BACK_COMMANDS = {"b", "back", "뒤로"}
+
+
+def _read_step(label: str, default: str) -> Any:
+    """One text-field prompt supporting the back-command -- returns `_BACK`
+    if the researcher typed b/back/뒤로 instead of a value, so the caller
+    can step to the previous field instead of accepting this one."""
+    raw = input(f"{label} [{default}] (뒤로: b): ").strip()
+    if raw.lower() in _BACK_COMMANDS:
+        return _BACK
+    return raw if raw else default
+
+
+def _parse_int_step(label: str, default: int) -> Any:
+    while True:
+        raw = input(f"{label} [{default}] (뒤로: b): ").strip()
+        if raw.lower() in _BACK_COMMANDS:
+            return _BACK
+        if not raw:
+            return default
+        try:
+            return int(raw)
+        except ValueError:
+            print("  정수를 입력해주세요.")
+
+
+def _parse_float_step(label: str, default: Optional[float]) -> Any:
+    while True:
+        raw = input(f"{label} [{default}] (뒤로: b): ").strip()
+        if raw.lower() in _BACK_COMMANDS:
+            return _BACK
+        if not raw:
+            return default
+        try:
+            return float(raw)
+        except ValueError:
+            print("  숫자를 입력해주세요.")
+
+
+# One (field_name, read_fn) pair per HWConfig field prompt_custom_hw_config
+# asks for, in order -- read_fn takes that field's current default/prior
+# answer and returns either the parsed value or `_BACK`.
+_CUSTOM_HW_CONFIG_STEPS: List[Tuple[str, Callable[[Any], Any]]] = [
+    ("hw_spec_id", lambda default: _read_step("hw_spec_id", default)),
+    ("crossbar_rows", lambda default: _parse_int_step("crossbar_rows", default)),
+    ("crossbar_cols", lambda default: _parse_int_step("crossbar_cols", default)),
+    ("num_tiles", lambda default: _parse_int_step("num_tiles", default)),
+    ("adc_bits", lambda default: _parse_int_step("adc_bits", default)),
+    ("dac_bits", lambda default: _parse_int_step("dac_bits", default)),
+    ("noc_topology", lambda default: _read_step("noc_topology (mesh/torus/ring/crossbar_bus)", default)),
+    ("noc_link_bandwidth_gbps", lambda default: _parse_float_step("noc_link_bandwidth_gbps", default)),
+    ("wire_resistance_ohm_per_um", lambda default: _parse_float_step("wire_resistance_ohm_per_um", default)),
+    ("device_noise_sigma", lambda default: _parse_float_step("device_noise_sigma", default)),
+    ("sram_buffer_kb", lambda default: _parse_float_step("sram_buffer_kb", default)),
+]
+
+
+def prompt_custom_hw_config() -> Optional[HWConfig]:
+    """Field-by-field HWConfig entry (Enter accepts the shown default; the
+    first pass through defaults to DEFAULT_HW_CONFIG's own values, so a
+    researcher who only cares about e.g. crossbar_rows/cols/adc_bits
+    doesn't have to know every field). Typing 'b'/'back'/'뒤로' at any
+    prompt steps back to the previous field instead of accepting the
+    current one -- no need to restart the whole 11-field sequence over one
+    typo. Typing it at the very *first* field (hw_spec_id) has nowhere
+    earlier to go back to within this form, so it cancels out of custom
+    entry entirely and returns `None` -- the caller (`prompt_for_hw_config`)
+    treats that as "show the [1]/[2]/[3] menu again", which is what a
+    researcher backing out of the first field of a wizard actually expects
+    (re-seeing the same first-field prompt would look like 'back' did
+    nothing at all).
+
+    Individual field prompts only catch type errors (e.g. a non-numeric
+    adc_bits); HWConfig's own range/enum rules (adc_bits<=16, a
+    noc_topology string it doesn't recognize, etc.) are only checked once
+    every field is in. On that failure, the offending field name(s) --
+    read straight from pydantic's own `ValidationError.errors()` -- are
+    printed and the whole step sequence restarts with every just-entered
+    value (including the invalid one, so it's visible to fix) as the new
+    default: re-confirming already-good fields is then a quick Enter-through,
+    not retyping everything from scratch.
+    """
+    original_defaults: Dict[str, Any] = {
+        "hw_spec_id": f"custom_{uuid.uuid4().hex[:8]}",
+        "crossbar_rows": DEFAULT_HW_CONFIG.crossbar_rows,
+        "crossbar_cols": DEFAULT_HW_CONFIG.crossbar_cols,
+        "num_tiles": DEFAULT_HW_CONFIG.num_tiles,
+        "adc_bits": DEFAULT_HW_CONFIG.adc_bits,
+        "dac_bits": DEFAULT_HW_CONFIG.dac_bits,
+        "noc_topology": DEFAULT_HW_CONFIG.noc_topology.value,
+        "noc_link_bandwidth_gbps": DEFAULT_HW_CONFIG.noc_link_bandwidth_gbps,
+        "wire_resistance_ohm_per_um": DEFAULT_HW_CONFIG.wire_resistance_ohm_per_um,
+        "device_noise_sigma": DEFAULT_HW_CONFIG.device_noise_sigma,
+        "sram_buffer_kb": DEFAULT_HW_CONFIG.sram_buffer_kb,
+    }
+    values: Dict[str, Any] = dict(original_defaults)
+
+    while True:
+        print("\n=== 커스텀 HWConfig 입력 (Enter로 기본값 유지, 'b'로 이전 필드) ===")
+        index = 0
+        while index < len(_CUSTOM_HW_CONFIG_STEPS):
+            name, read_fn = _CUSTOM_HW_CONFIG_STEPS[index]
+            result = read_fn(values[name])
+            if result is _BACK:
+                if index == 0:
+                    print("첫 번째 필드입니다 -- 이전 메뉴로 돌아갑니다.")
+                    return None
+                index -= 1
+                continue
+            values[name] = result
+            index += 1
+
+        try:
+            return HWConfig(**values)
+        except ValidationError as exc:
+            bad_fields = sorted({str(error["loc"][0]) for error in exc.errors() if error.get("loc")})
+            print(
+                f"입력값이 HWConfig 스키마에 맞지 않습니다 ({', '.join(bad_fields) or '알 수 없는 필드'}):\n{exc}\n"
+                "해당 필드는 원래 기본값으로 되돌리고 나머지는 방금 입력한 값을 유지합니다 -- 다시 확인해주세요."
+            )
+            # Reset only the offending field(s) to their *original* default
+            # (never the just-typed invalid value) -- otherwise hitting
+            # Enter on a bad field re-submits the same invalid value and
+            # loops forever. Every other field keeps what was already
+            # entered, so re-confirming them is a quick Enter-through.
+            for field in bad_fields:
+                if field in values:
+                    values[field] = original_defaults[field]
+
+
+def prompt_hw_config_from_examples() -> Optional[HWConfig]:
+    """Lets a researcher pick one of the checked-in examples/hw_configs/
+    files by number instead of typing its path -- `None` (caller falls back
+    to DEFAULT_HW_CONFIG) if the directory is empty or the researcher
+    cancels (blank input) or mistypes the number."""
+    files = sorted(EXAMPLE_HW_CONFIGS_DIR.glob("*.json"))
+    if not files:
+        return None
+    print("\n=== 저장된 예시 --hw-config 파일 ===")
+    for i, f in enumerate(files, 1):
+        print(f"  [{i}] {f.name}")
+    raw = input("번호 선택 (Enter로 취소): ").strip()
+    if not raw:
+        return None
+    try:
+        index = int(raw)
+        if not (1 <= index <= len(files)):
+            raise ValueError
+    except ValueError:
+        print("잘못된 선택입니다 -- 기본값을 사용합니다.")
+        return None
+    return load_hw_config(str(files[index - 1]))
+
+
+def prompt_for_hw_config() -> Tuple[HWConfig, bool]:
+    """Interactive --hw-config picker -- main() calls this only when
+    --hw-config was omitted and stdin is a real terminal, so a scripted/CI
+    invocation (or one that already passes --hw-config) never sees it and
+    behaves exactly as before this existed.
+
+    Offers: type a custom HWConfig directly (prompt_custom_hw_config), pick
+    a saved examples/hw_configs/ file (prompt_hw_config_from_examples), or
+    the built-in default. Immediately reports whether the resulting
+    hw_config has an exact tools/calibration.py match and, if not, offers
+    approximate calibration for just this run (the returned bool) --
+    without requiring the researcher to already know
+    --allow-approximate-calibration exists. EOFError/KeyboardInterrupt at
+    any point falls back to (DEFAULT_HW_CONFIG, False) rather than crashing
+    -- same "soft, non-destructive fallback" spirit as prompt_for_override's
+    HITL handling.
+    """
+    try:
+        hw_config: Optional[HWConfig] = None
+        while hw_config is None:
+            print("\n--hw-config가 지정되지 않았습니다. 어떻게 진행할까요?")
+            print("  [1] 직접 값 입력 (커스텀 HWConfig)")
+            print("  [2] 저장된 예시 파일 사용")
+            print("  [3] 기본값 사용")
+            choice = input("선택 [3]: ").strip() or "3"
+
+            if choice == "1":
+                hw_config = prompt_custom_hw_config()  # None if cancelled via 'back' on the first field -> loop, re-show menu
+            elif choice == "2":
+                hw_config = prompt_hw_config_from_examples() or DEFAULT_HW_CONFIG
+            else:
+                hw_config = DEFAULT_HW_CONFIG
+    except (EOFError, KeyboardInterrupt):
+        print("\n입력을 받지 못해 기본값을 사용합니다.")
+        return DEFAULT_HW_CONFIG, False
+
+    if bootstrap_calibration_factors(hw_config):
+        print("[calibration] exact match")
+        return hw_config, False
+
+    nearest = find_nearest_reference(hw_config)
+    if nearest is None:
+        print("[calibration] uncalibrated (no known reference)")
+        return hw_config, False
+
+    reference, distance = nearest
+    print(
+        f"[calibration] 정확히 일치하는 레퍼런스가 없습니다. 가장 가까운 레퍼런스: "
+        f"{reference.crossbar_rows}x{reference.crossbar_cols}/{reference.adc_bits}-bit ADC "
+        f"(distance={distance:.2f})"
+    )
+    try:
+        answer = input("  이 레퍼런스로 근사 보정해서 진행할까요? [Y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        answer = ""
+    return hw_config, answer == "y"
+
+
 def build_initial_state(
     model_id: str,
     hw_config: HWConfig,
     target_accuracy: Optional[float] = None,
     target_energy_pj: Optional[float] = None,
     target_latency_ms: Optional[float] = None,
+    allow_approximate_calibration: bool = False,
 ) -> AutoCIMState:
+    if allow_approximate_calibration:
+        # --allow-approximate-calibration: nearest-KNOWN_REFERENCES fallback
+        # (tools/calibration.py) when hw_config has no exact match. When it
+        # *does* have an exact match, this returns the identical factor
+        # bootstrap_calibration_factors would (distance 0 to that same
+        # reference) -- so opting in never changes an already-exact-matched
+        # session, only rescues an otherwise-uncalibrated one.
+        calibration_factors = bootstrap_approximate_calibration_factors(hw_config)
+        calibration_provenance = bootstrap_approximate_calibration_provenance(hw_config)
+    else:
+        # tools/calibration.py: seeds a real, literature-derived correction
+        # factor when hw_config exactly matches a known reference (e.g. the
+        # NeuroSim-validated 128x128/7-bit-ADC config); otherwise {} --
+        # @profiler stays uncalibrated (factor 1.0) rather than guessing.
+        calibration_factors = bootstrap_calibration_factors(hw_config)
+        calibration_provenance = bootstrap_calibration_provenance(hw_config)
     return {
         "messages": [],
         "failure_history": [],
@@ -198,15 +458,13 @@ def build_initial_state(
         "llm_usage": [],
         "planner_decisions": [],
         "metrics_store": {},
-        # tools/calibration.py: seeds a real, literature-derived correction
-        # factor when hw_config exactly matches a known reference (e.g. the
-        # NeuroSim-validated 128x128/7-bit-ADC config); otherwise {} --
-        # @profiler stays uncalibrated (factor 1.0) rather than guessing.
-        "calibration_factors": bootstrap_calibration_factors(hw_config),
-        # The citation/uncertainty behind that factor (or {} if
+        # The citation/uncertainty behind calibration_factors (or {} if
         # uncalibrated) -- tools/dashboard.py surfaces this so a researcher
-        # sees *which* published number backs a candidate's energy figure.
-        "calibration_provenance": bootstrap_calibration_provenance(hw_config),
+        # sees *which* published number backs a candidate's energy figure,
+        # and whether it's an exact match or an approximate (see above)
+        # scaling-law transfer.
+        "calibration_factors": calibration_factors,
+        "calibration_provenance": calibration_provenance,
         "human_overrides": {},
         "planned_layer_configs": [],
         "model_id": model_id,
@@ -237,6 +495,29 @@ def prompt_for_override(interrupt_payload: Dict[str, Any]) -> Dict[str, Any]:
     raw = input('Enter new_bounds as JSON (e.g. {"weight_bits_min": 2}), or leave blank to retry unchanged: ').strip()
     new_bounds = json.loads(raw) if raw else {}
     return {"new_bounds": new_bounds}
+
+
+def prompt_for_dashboard_out(hw_spec_id: str, thread_id: str) -> Optional[str]:
+    """Interactive --dashboard-out picker -- main() calls this only when
+    --dashboard-out was omitted and stdin is a real terminal, same gating as
+    prompt_for_hw_config so a scripted/CI invocation never sees it. Default
+    filename is derived from hw_spec_id + thread_id (already unique per
+    fresh session) so back-to-back interactive runs never clobber each
+    other's report. EOFError/KeyboardInterrupt falls back to None (no
+    report), matching prompt_for_hw_config's non-destructive fallback.
+    """
+    try:
+        answer = input("\n리포트(HTML 대시보드)를 생성할까요? [Y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return None
+    if answer != "y":
+        return None
+    default_name = f"report_{hw_spec_id}_{thread_id[:8]}_{datetime.now():%Y%m%d_%H%M%S}.html"
+    try:
+        raw = input(f"저장 경로 [{default_name}]: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        raw = ""
+    return raw or default_name
 
 
 def _truncate(text: Optional[str], max_chars: int = 80) -> str:
@@ -406,6 +687,24 @@ def write_dashboard(graph, config: Dict[str, Any], dashboard_out: Optional[str])
     print(f"[dashboard] wrote {dashboard_out}")
 
 
+def _describe_calibration_status(calibration_provenance: Dict[str, Any], hw_spec_id: str) -> str:
+    """One-line summary of how (or whether) `hw_spec_id` got calibrated --
+    printed at fresh-session start so a researcher never has to dig into
+    `calibration_provenance` just to learn whether an energy number is an
+    exact citation, a --allow-approximate-calibration extrapolation, or
+    uncalibrated (factor 1.0)."""
+    described = calibration_provenance.get(hw_spec_id)
+    if described is None:
+        return "uncalibrated (no exact match; pass --allow-approximate-calibration for a best-effort factor)"
+    if described.get("approximate"):
+        return (
+            f"approximate (nearest reference {described['matched_crossbar_rows']}x"
+            f"{described['matched_crossbar_cols']}/{described['matched_adc_bits']}-bit ADC, "
+            f"distance={described['distance']})"
+        )
+    return "exact match"
+
+
 def run_session(
     model_id: str,
     hw_config: HWConfig,
@@ -416,6 +715,7 @@ def run_session(
     target_accuracy: Optional[float] = None,
     target_energy_pj: Optional[float] = None,
     target_latency_ms: Optional[float] = None,
+    allow_approximate_calibration: bool = False,
 ) -> None:
     register_hw_config(hw_config)
     graph = build_graph(checkpointer=checkpointer)
@@ -455,7 +755,10 @@ def run_session(
             f"hw_spec_id={hw_config.hw_spec_id!r} thread_id={thread_id!r}"
         )
         resumable_input = build_initial_state(
-            model_id, hw_config, target_accuracy, target_energy_pj, target_latency_ms
+            model_id, hw_config, target_accuracy, target_energy_pj, target_latency_ms, allow_approximate_calibration
+        )
+        print(
+            f"[calibration] {_describe_calibration_status(resumable_input['calibration_provenance'], hw_config.hw_spec_id)}"
         )
 
         if parallel_warmup_workers is not None:
@@ -518,12 +821,25 @@ def main() -> None:
             print_sessions(list_sessions(checkpointer))
         return
 
+    allow_approximate_from_prompt = False
     try:
-        hw_config = load_hw_config(args.hw_config)
+        if args.hw_config is None and sys.stdin.isatty():
+            # No --hw-config given and a human is actually at the terminal
+            # (not a script/CI pipe) -- offer the interactive picker instead
+            # of silently falling back to DEFAULT_HW_CONFIG. Passing
+            # --hw-config explicitly (any value) always skips this, so
+            # existing scripts/automation are unaffected.
+            hw_config, allow_approximate_from_prompt = prompt_for_hw_config()
+        else:
+            hw_config = load_hw_config(args.hw_config)
     except HWConfigError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         raise SystemExit(1) from None
     thread_id = args.thread_id or str(uuid.uuid4())
+
+    dashboard_out = args.dashboard_out
+    if dashboard_out is None and sys.stdin.isatty():
+        dashboard_out = prompt_for_dashboard_out(hw_config.hw_spec_id, thread_id)
 
     with SqliteSaver.from_conn_string(checkpoint_db) as checkpointer:
         run_session(
@@ -531,11 +847,12 @@ def main() -> None:
             hw_config,
             thread_id,
             checkpointer,
-            dashboard_out=args.dashboard_out,
+            dashboard_out=dashboard_out,
             parallel_warmup_workers=args.parallel_warmup_workers,
             target_accuracy=args.target_accuracy,
             target_energy_pj=args.target_energy_pj,
             target_latency_ms=args.target_latency_ms,
+            allow_approximate_calibration=args.allow_approximate_calibration or allow_approximate_from_prompt,
         )
 
 
