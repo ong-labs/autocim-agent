@@ -14,12 +14,15 @@ main() itself exercises.
 """
 
 import json
+import sys
+from datetime import datetime
 
 import pytest
 from langgraph.checkpoint.sqlite import SqliteSaver
 
 import main
 from main import DEFAULT_HW_CONFIG, HWConfigError, list_sessions, load_hw_config, print_sessions, run_session
+from tools.calibration import bootstrap_calibration_factors
 
 
 def test_load_hw_config_returns_default_when_path_is_none():
@@ -46,9 +49,21 @@ def test_load_hw_config_raises_for_schema_violation(tmp_path):
         load_hw_config(str(invalid))
 
 
+_CALIBRATED_EXAMPLE_FILES = [
+    "calibrated_neurosim_v1_5.json",
+    "calibrated_correll_2025_reram_256x64.json",
+    "calibrated_daram_2021_reram_64x32.json",
+    "calibrated_yu_2020_sram_128x128_1bit.json",
+    "calibrated_yu_2020_sram_128x128_5bit.json",
+    "calibrated_dong_2020_sram_64x64.json",
+    "calibrated_deaville_2022_mram_256x512.json",
+    "calibrated_korea_univ_2022_sram_256x80.json",
+]
+
+
 @pytest.mark.parametrize(
     "example_file",
-    ["cim_v1_128x128.json", "calibrated_neurosim_v1_5.json", "high_ir_drop_never_converges.json"],
+    ["cim_v1_128x128.json", "high_ir_drop_never_converges.json", *_CALIBRATED_EXAMPLE_FILES],
 )
 def test_example_hw_configs_load_successfully(example_file):
     """The checked-in examples/hw_configs/ files must stay valid HWConfigs
@@ -56,6 +71,319 @@ def test_example_hw_configs_load_successfully(example_file):
     path = f"examples/hw_configs/{example_file}"
     hw = load_hw_config(path)
     assert hw.hw_spec_id
+
+
+@pytest.mark.parametrize("example_file", _CALIBRATED_EXAMPLE_FILES)
+def test_calibrated_example_hw_configs_exactly_match_a_known_reference(example_file):
+    """Each examples/hw_configs/calibrated_*.json file exists specifically to
+    save a researcher from hand-writing crossbar_rows/cols/adc_bits that
+    exactly match a tools.calibration.KNOWN_REFERENCES entry -- a typo here
+    would silently turn a 'calibrated' example into an uncalibrated one, and
+    only this test would catch it (main.py's own --hw-config loading only
+    checks HWConfig schema validity, not calibration match)."""
+    hw = load_hw_config(f"examples/hw_configs/{example_file}")
+    assert bootstrap_calibration_factors(hw) != {}
+
+
+# --- Interactive --hw-config picker --------------------------------------------
+
+
+def _feed_inputs(monkeypatch, values):
+    """Scripts builtins.input() to return `values` in order -- a call past
+    the end raises StopIteration (an unhandled exception fails the test),
+    which doubles as an assertion that the code under test doesn't prompt
+    more times than expected."""
+    iterator = iter(values)
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(iterator))
+
+
+def test_prompt_custom_hw_config_builds_from_scripted_input(monkeypatch):
+    _feed_inputs(
+        monkeypatch,
+        ["my_custom_chip", "64", "64", "8", "4", "8", "ring", "20.0", "0.1", "0.02", "128.0"],
+    )
+
+    hw = main.prompt_custom_hw_config()
+
+    assert hw.hw_spec_id == "my_custom_chip"
+    assert hw.crossbar_rows == 64
+    assert hw.crossbar_cols == 64
+    assert hw.adc_bits == 4
+    assert hw.noc_topology.value == "ring"
+    assert hw.noc_link_bandwidth_gbps == 20.0
+
+
+def test_prompt_custom_hw_config_uses_defaults_on_blank_input(monkeypatch):
+    _feed_inputs(monkeypatch, [""] * 11)
+
+    hw = main.prompt_custom_hw_config()
+
+    assert hw.crossbar_rows == DEFAULT_HW_CONFIG.crossbar_rows
+    assert hw.crossbar_cols == DEFAULT_HW_CONFIG.crossbar_cols
+    assert hw.adc_bits == DEFAULT_HW_CONFIG.adc_bits
+    assert hw.hw_spec_id.startswith("custom_")
+
+
+def test_prompt_custom_hw_config_reprompts_on_invalid_noc_topology(monkeypatch, capsys):
+    bad_pass = ["", "", "", "", "", "", "bogus", "", "", "", ""]  # 7th field is noc_topology
+    good_pass = [""] * 11
+    _feed_inputs(monkeypatch, bad_pass + good_pass)
+
+    hw = main.prompt_custom_hw_config()
+
+    assert hw.noc_topology == DEFAULT_HW_CONFIG.noc_topology
+    assert "다시 확인해주세요" in capsys.readouterr().out
+
+
+def test_prompt_custom_hw_config_reprompt_only_resets_the_offending_field(monkeypatch):
+    """A validation failure must only reset the *bad* field to its original
+    default -- every other already-entered (valid) value must survive the
+    restart, so the researcher isn't forced to retype fields that were
+    already correct."""
+    bad_pass = ["my_chip", "77", "77", "16", "8", "8", "bogus", "10.0", "0.1", "0.02", "128.0"]
+    fix_pass = ["", "", "", "", "", "", "", "", "", "", ""]  # blank noc_topology now falls back to a valid default
+    _feed_inputs(monkeypatch, bad_pass + fix_pass)
+
+    hw = main.prompt_custom_hw_config()
+
+    assert hw.hw_spec_id == "my_chip"
+    assert hw.crossbar_rows == 77
+    assert hw.crossbar_cols == 77
+    assert hw.sram_buffer_kb == 128.0
+    assert hw.noc_topology == DEFAULT_HW_CONFIG.noc_topology  # the one field that got reset
+
+
+def test_prompt_custom_hw_config_back_command_returns_to_the_previous_field(monkeypatch):
+    # hw_spec_id="", crossbar_rows="999" (typo), then "b" at crossbar_cols
+    # steps back to redo crossbar_rows as "64"; everything else blank.
+    _feed_inputs(monkeypatch, ["", "999", "b", "64", ""] + [""] * 8)
+
+    hw = main.prompt_custom_hw_config()
+
+    assert hw.crossbar_rows == 64
+
+
+def test_prompt_custom_hw_config_back_on_the_first_field_cancels(monkeypatch, capsys):
+    # "b" on the very first field (hw_spec_id) has nowhere earlier to go
+    # back to within this form -- it must cancel (return None) rather than
+    # silently re-showing the identical prompt, which would look like
+    # 'back' did nothing.
+    _feed_inputs(monkeypatch, ["b"])
+
+    result = main.prompt_custom_hw_config()
+
+    assert result is None
+    assert "이전 메뉴로 돌아갑니다" in capsys.readouterr().out
+
+
+def test_prompt_hw_config_from_examples_returns_the_selected_file(monkeypatch):
+    files = sorted(main.EXAMPLE_HW_CONFIGS_DIR.glob("*.json"))
+    _feed_inputs(monkeypatch, ["1"])
+
+    hw = main.prompt_hw_config_from_examples()
+
+    assert hw.hw_spec_id == main.load_hw_config(str(files[0])).hw_spec_id
+
+
+def test_prompt_hw_config_from_examples_returns_none_on_blank_input(monkeypatch):
+    _feed_inputs(monkeypatch, [""])
+    assert main.prompt_hw_config_from_examples() is None
+
+
+def test_prompt_hw_config_from_examples_returns_none_on_invalid_number(monkeypatch, capsys):
+    _feed_inputs(monkeypatch, ["9999"])
+    assert main.prompt_hw_config_from_examples() is None
+    assert "잘못된 선택" in capsys.readouterr().out
+
+
+def test_prompt_for_hw_config_default_choice_offers_approximate_when_unmatched(monkeypatch, capsys):
+    # "" -> menu choice 3 (default); DEFAULT_HW_CONFIG has no exact match
+    # (its adc_bits=8 doesn't match the one 128x128 reference, adc_bits=7),
+    # so a second input (the approximate-calibration y/N prompt) is consumed.
+    _feed_inputs(monkeypatch, ["", "n"])
+
+    hw, allow_approximate = main.prompt_for_hw_config()
+
+    assert hw.hw_spec_id == DEFAULT_HW_CONFIG.hw_spec_id
+    assert allow_approximate is False
+    assert "가장 가까운 레퍼런스" in capsys.readouterr().out
+
+
+def test_prompt_for_hw_config_accepts_approximate_calibration_on_yes(monkeypatch):
+    _feed_inputs(monkeypatch, ["", "y"])
+    _hw, allow_approximate = main.prompt_for_hw_config()
+    assert allow_approximate is True
+
+
+def test_prompt_for_hw_config_exact_match_skips_the_approximate_prompt(monkeypatch, capsys):
+    files = sorted(main.EXAMPLE_HW_CONFIGS_DIR.glob("*.json"))
+    index = next(i for i, f in enumerate(files, 1) if f.name == "calibrated_neurosim_v1_5.json")
+    # Only two inputs queued (menu choice "2", then the file number) -- a
+    # third input() call (i.e. an unwanted approximate-calibration prompt
+    # for an already-exact match) would raise StopIteration and fail the test.
+    _feed_inputs(monkeypatch, ["2", str(index)])
+
+    hw, allow_approximate = main.prompt_for_hw_config()
+
+    assert hw.hw_spec_id == "calibrated_neurosim_v1_5"
+    assert allow_approximate is False
+    assert "exact match" in capsys.readouterr().out
+
+
+def test_prompt_for_hw_config_reshows_menu_when_custom_entry_is_cancelled(monkeypatch):
+    # "1" -> custom entry; "b" on hw_spec_id cancels back to the menu;
+    # "3" -> default this time; "n" -> decline the approximate-calibration
+    # offer (DEFAULT_HW_CONFIG has no exact match).
+    _feed_inputs(monkeypatch, ["1", "b", "3", "n"])
+
+    hw, allow_approximate = main.prompt_for_hw_config()
+
+    assert hw.hw_spec_id == DEFAULT_HW_CONFIG.hw_spec_id
+    assert allow_approximate is False
+
+
+def test_prompt_for_hw_config_falls_back_to_default_on_eof(monkeypatch, capsys):
+    monkeypatch.setattr("builtins.input", lambda prompt="": (_ for _ in ()).throw(EOFError()))
+
+    hw, allow_approximate = main.prompt_for_hw_config()
+
+    assert hw is DEFAULT_HW_CONFIG
+    assert allow_approximate is False
+    assert "기본값을 사용" in capsys.readouterr().out
+
+
+def test_prompt_for_dashboard_out_declines_by_default(monkeypatch):
+    # "" -> [y/N] default is "no report"; a second input() call (the path
+    # prompt) would raise StopIteration and fail the test.
+    _feed_inputs(monkeypatch, [""])
+    assert main.prompt_for_dashboard_out("cim_v1_128x128", "abcd1234-...") is None
+
+
+def test_prompt_for_dashboard_out_yes_with_blank_path_uses_default_name(monkeypatch):
+    class _FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 7, 28, 15, 4, 5)
+
+    monkeypatch.setattr(main, "datetime", _FixedDatetime)
+    _feed_inputs(monkeypatch, ["y", ""])
+    result = main.prompt_for_dashboard_out("cim_v1_128x128", "abcd1234-5678")
+    assert result == "report_cim_v1_128x128_abcd1234_20260728_150405.html"
+
+
+def test_prompt_for_dashboard_out_yes_with_custom_path(monkeypatch, tmp_path):
+    custom = str(tmp_path / "my_report.html")
+    _feed_inputs(monkeypatch, ["y", custom])
+    assert main.prompt_for_dashboard_out("cim_v1_128x128", "abcd1234-5678") == custom
+
+
+def test_prompt_for_dashboard_out_falls_back_to_none_on_eof(monkeypatch):
+    monkeypatch.setattr("builtins.input", lambda prompt="": (_ for _ in ()).throw(EOFError()))
+    assert main.prompt_for_dashboard_out("cim_v1_128x128", "abcd1234-5678") is None
+
+
+def test_main_invokes_interactive_prompt_when_hw_config_omitted_and_stdin_is_a_tty(monkeypatch, tmp_path):
+    calls = {}
+
+    def fake_prompt():
+        calls["invoked"] = True
+        return DEFAULT_HW_CONFIG, False
+
+    monkeypatch.setattr(main, "prompt_for_hw_config", fake_prompt)
+    monkeypatch.setattr(main, "prompt_for_dashboard_out", lambda hw_spec_id, thread_id: None)
+    monkeypatch.setattr(main, "run_session", lambda *args, **kwargs: None)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("sys.argv", ["main.py", "--checkpoint-db", str(tmp_path / "checkpoints.sqlite")])
+
+    main.main()
+
+    assert calls.get("invoked") is True
+
+
+def test_main_skips_interactive_prompt_when_hw_config_is_given(monkeypatch, tmp_path):
+    def fail_if_called():
+        raise AssertionError("prompt_for_hw_config must not be called when --hw-config is given")
+
+    monkeypatch.setattr(main, "prompt_for_hw_config", fail_if_called)
+    monkeypatch.setattr(main, "prompt_for_dashboard_out", lambda hw_spec_id, thread_id: None)
+    monkeypatch.setattr(main, "run_session", lambda *args, **kwargs: None)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "main.py",
+            "--hw-config",
+            "examples/hw_configs/cim_v1_128x128.json",
+            "--checkpoint-db",
+            str(tmp_path / "checkpoints.sqlite"),
+        ],
+    )
+
+    main.main()  # must not raise (prompt_for_hw_config would if called)
+
+
+def test_main_skips_interactive_prompt_when_stdin_is_not_a_tty(monkeypatch, tmp_path):
+    def fail_if_called():
+        raise AssertionError("prompt_for_hw_config must not be called when stdin isn't a tty")
+
+    monkeypatch.setattr(main, "prompt_for_hw_config", fail_if_called)
+    monkeypatch.setattr(main, "run_session", lambda *args, **kwargs: None)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    monkeypatch.setattr("sys.argv", ["main.py", "--checkpoint-db", str(tmp_path / "checkpoints.sqlite")])
+
+    main.main()  # must not raise
+
+
+def test_main_invokes_dashboard_prompt_when_dashboard_out_omitted_and_stdin_is_a_tty(monkeypatch, tmp_path):
+    calls = {}
+
+    def fake_prompt(hw_spec_id, thread_id):
+        calls["invoked"] = True
+        return None
+
+    monkeypatch.setattr(main, "prompt_for_hw_config", lambda: (DEFAULT_HW_CONFIG, False))
+    monkeypatch.setattr(main, "prompt_for_dashboard_out", fake_prompt)
+    monkeypatch.setattr(main, "run_session", lambda *args, **kwargs: None)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("sys.argv", ["main.py", "--checkpoint-db", str(tmp_path / "checkpoints.sqlite")])
+
+    main.main()
+
+    assert calls.get("invoked") is True
+
+
+def test_main_skips_dashboard_prompt_when_dashboard_out_is_given(monkeypatch, tmp_path):
+    def fail_if_called(hw_spec_id, thread_id):
+        raise AssertionError("prompt_for_dashboard_out must not be called when --dashboard-out is given")
+
+    monkeypatch.setattr(main, "prompt_for_hw_config", lambda: (DEFAULT_HW_CONFIG, False))
+    monkeypatch.setattr(main, "prompt_for_dashboard_out", fail_if_called)
+    monkeypatch.setattr(main, "run_session", lambda *args, **kwargs: None)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "main.py",
+            "--dashboard-out",
+            str(tmp_path / "report.html"),
+            "--checkpoint-db",
+            str(tmp_path / "checkpoints.sqlite"),
+        ],
+    )
+
+    main.main()  # must not raise (prompt_for_dashboard_out would if called)
+
+
+def test_main_skips_dashboard_prompt_when_stdin_is_not_a_tty(monkeypatch, tmp_path):
+    def fail_if_called(hw_spec_id, thread_id):
+        raise AssertionError("prompt_for_dashboard_out must not be called when stdin isn't a tty")
+
+    monkeypatch.setattr(main, "prompt_for_dashboard_out", fail_if_called)
+    monkeypatch.setattr(main, "run_session", lambda *args, **kwargs: None)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    monkeypatch.setattr("sys.argv", ["main.py", "--checkpoint-db", str(tmp_path / "checkpoints.sqlite")])
+
+    main.main()  # must not raise
 
 
 # --- --list-sessions ----------------------------------------------------------
@@ -170,6 +498,50 @@ def test_run_session_without_the_flag_keeps_todays_sequential_behavior(tmp_path,
 
     assert sessions[0]["is_converged"] is True
     assert sessions[0]["iteration_count"] == 1  # good_hw_config converges on the very first real iteration
+
+
+# --- --allow-approximate-calibration -------------------------------------------
+#
+# registered_hw_config (good_hw_config: 128x128, adc_bits=8) has no exact
+# match in tools/calibration.py's KNOWN_REFERENCES -- the one 128x128
+# reference there is adc_bits=7, not 8 -- so it's a real unmatched HWConfig,
+# not something that happens to already be exactly calibrated.
+
+
+def test_build_initial_state_leaves_unmatched_hw_uncalibrated_by_default(registered_hw_config):
+    state = main.build_initial_state("resnet18", registered_hw_config)
+    assert state["calibration_factors"] == {}
+    assert state["calibration_provenance"] == {}
+
+
+def test_build_initial_state_with_allow_approximate_calibration_seeds_a_factor(registered_hw_config):
+    state = main.build_initial_state("resnet18", registered_hw_config, allow_approximate_calibration=True)
+
+    assert registered_hw_config.hw_spec_id in state["calibration_factors"]
+    assert state["calibration_factors"][registered_hw_config.hw_spec_id] > 0
+    assert state["calibration_provenance"][registered_hw_config.hw_spec_id]["approximate"] is True
+
+
+def test_run_session_prints_uncalibrated_status_by_default(capsys, tmp_path, registered_hw_config):
+    db_path = str(tmp_path / "checkpoints.sqlite")
+    with SqliteSaver.from_conn_string(db_path) as checkpointer:
+        run_session("resnet18", registered_hw_config, "thread-calib-default", checkpointer)
+
+    assert "[calibration] uncalibrated" in capsys.readouterr().out
+
+
+def test_run_session_with_allow_approximate_calibration_prints_approximate_status(capsys, tmp_path, registered_hw_config):
+    db_path = str(tmp_path / "checkpoints.sqlite")
+    with SqliteSaver.from_conn_string(db_path) as checkpointer:
+        run_session(
+            "resnet18",
+            registered_hw_config,
+            "thread-calib-approx",
+            checkpointer,
+            allow_approximate_calibration=True,
+        )
+
+    assert "[calibration] approximate" in capsys.readouterr().out
 
 
 # --- .env/.env.local auto-loading ---------------------------------------------
