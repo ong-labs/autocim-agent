@@ -163,6 +163,34 @@ def parse_args() -> argparse.Namespace:
         help="Optional convergence gate: a candidate's noc_latency_ms must be at or below this value. Omit to leave ungated.",
     )
     parser.add_argument(
+        "--auto-hitl",
+        action="store_true",
+        help=(
+            "Opt-in: resolve HITL interrupts (nodes/hitl.py) without blocking on "
+            "researcher input, via a rule-based override (main.py's "
+            "auto_resolve_override). Only resolves target-accuracy/energy/latency "
+            "misses that a weight_bits/pruning_ratio bounds adjustment could "
+            "plausibly fix; anything else (physically-infeasible hw_spec_id per "
+            "@verifier, a schema/validation error, or conflicting accuracy-vs-"
+            "energy/latency misses in the same iteration) stops the run instead of "
+            "guessing, since no bounds change can resolve those and blind retries "
+            "would just burn real QAT trials. Omit to keep the default interactive "
+            "input() prompt."
+        ),
+    )
+    parser.add_argument(
+        "--auto-hitl-max-rounds",
+        type=int,
+        default=2,
+        metavar="N",
+        help=(
+            "With --auto-hitl: stop the run (instead of resolving further) after N "
+            "auto-resolved HITL rounds in this invocation, so a search that keeps "
+            "missing target even after bounds adjustments doesn't loop unattended "
+            "forever. Ignored without --auto-hitl."
+        ),
+    )
+    parser.add_argument(
         "--allow-approximate-calibration",
         action="store_true",
         help=(
@@ -479,6 +507,83 @@ def build_initial_state(
     }
 
 
+_AUTO_HITL_BITS_STEP = 1
+_AUTO_HITL_PRUNING_STEP = 0.1
+
+
+def suggest_override_bounds(interrupt_payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Rule-based `new_bounds` suggestion for a HITL interrupt -- the shared
+    logic behind both `auto_resolve_override` (--auto-hitl, applies it
+    unattended) and `prompt_for_override` (prints it as a suggestion a
+    researcher can accept, tweak, or ignore). No side effects (no printing,
+    doesn't apply anything) -- purely a function of `interrupt_payload`.
+
+    Classifies the failure that triggered this interrupt from
+    `failure_history`'s machine-readable reason strings
+    (`nodes/evaluator.py`'s `check_targets` always prefixes each reason with
+    "accuracy "/"energy_pj "/"noc_latency_ms "), and only proposes a
+    weight_bits/pruning_ratio bounds override when the failure is actually
+    something a layer_config search could plausibly fix.
+
+    Returns None whenever it can't safely suggest one:
+      - reason == "verifier reported not converged" (nodes/evaluator.py):
+        IR-drop/noise margin is a pure function of HWConfig
+        (`tools/simulators.py`'s `verifier_tool`: wire_resistance_ohm_per_um /
+        crossbar_rows / adc_bits / device_noise_sigma only), independent of
+        any layer_config. No bounds override can ever fix this -- retrying
+        would just burn real QAT trials against an hw_spec_id that's
+        physically infeasible regardless of the model config.
+      - a raw validation-error reason (unrecognized prefix): a schema/tool
+        bug, not a search problem.
+      - accuracy-too-low and energy_pj/noc_latency_ms-too-high are both
+        reported in the same iteration: they pull the one shared knob
+        (weight_bits / column_pruning_ratio) in opposite directions, so
+        this is a genuine trade-off call for a human, not something one
+        fixed rule should decide silently.
+      - the last candidate's avg_weight_bits/avg_column_pruning_ratio
+        (`nodes/evaluator.py`'s `build_candidate_entry`) aren't available to
+        compute a step from.
+    """
+    failure_history = interrupt_payload.get("failure_history") or []
+    if not failure_history:
+        return None
+    reason = failure_history[-1].get("reason", "")
+    segments = [s.strip() for s in reason.split(";") if s.strip()]
+    if not segments:
+        return None
+
+    wants_precision = False  # accuracy too low -> more weight_bits, less pruning
+    wants_compression = False  # energy/latency too high -> fewer weight_bits, more pruning
+    for seg in segments:
+        if seg.startswith("accuracy "):
+            wants_precision = True
+        elif seg.startswith("energy_pj ") or seg.startswith("noc_latency_ms "):
+            wants_compression = True
+        else:
+            return None  # "verifier reported not converged" or a validation error
+
+    if wants_precision == wants_compression:
+        # Both True (conflicting objectives) or both False (nothing
+        # recognized) -- neither is safe to resolve with one fixed rule.
+        return None
+
+    tuner_data = (interrupt_payload.get("latest_metrics") or {}).get("tuner", {}).get("data") or {}
+    current_bits = tuner_data.get("avg_weight_bits")
+    current_pruning = tuner_data.get("avg_column_pruning_ratio")
+    if current_bits is None or current_pruning is None:
+        return None
+
+    if wants_precision:
+        return {
+            "weight_bits_min": round(current_bits) + _AUTO_HITL_BITS_STEP,
+            "pruning_ratio_max": max(0.0, round(current_pruning - _AUTO_HITL_PRUNING_STEP, 4)),
+        }
+    return {
+        "weight_bits_max": max(1, round(current_bits) - _AUTO_HITL_BITS_STEP),
+        "pruning_ratio_min": min(0.9, round(current_pruning + _AUTO_HITL_PRUNING_STEP, 4)),
+    }
+
+
 def prompt_for_override(interrupt_payload: Dict[str, Any]) -> Dict[str, Any]:
     """Blocks on researcher input and shapes it into the
     `Command(resume={"new_bounds": ...})` contract `hitl_node` expects."""
@@ -492,8 +597,30 @@ def prompt_for_override(interrupt_payload: Dict[str, Any]) -> Dict[str, Any]:
     if latest:
         print(f"latest verifier: {latest}")
 
-    raw = input('Enter new_bounds as JSON (e.g. {"weight_bits_min": 2}), or leave blank to retry unchanged: ').strip()
+    suggestion = suggest_override_bounds(interrupt_payload)
+    if suggestion is not None:
+        print(f"suggested new_bounds (heuristic, not applied automatically -- paste as-is or edit): {json.dumps(suggestion)}")
+
+    raw = input(
+        # Keys recognized by nodes/planner.py's search_bounds()/_clamp_layer_configs() --
+        # any other key is accepted as valid JSON but silently has no effect.
+        "Enter new_bounds as JSON (recognized keys: weight_bits_min, weight_bits_max, "
+        "pruning_ratio_min, pruning_ratio_max), or leave blank to retry unchanged: "
+    ).strip()
     new_bounds = json.loads(raw) if raw else {}
+    return {"new_bounds": new_bounds}
+
+
+def auto_resolve_override(interrupt_payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Rule-based, unattended stand-in for `prompt_for_override` (--auto-hitl)
+    -- applies `suggest_override_bounds`'s suggestion directly instead of
+    just printing it, or returns None (caller must stop the run rather than
+    keep retrying) when there's nothing safe to suggest."""
+    new_bounds = suggest_override_bounds(interrupt_payload)
+    if new_bounds is None:
+        return None
+    reason = (interrupt_payload.get("failure_history") or [{}])[-1].get("reason", "")
+    print(f"\n[auto-hitl] resolved without researcher input: reason={reason!r} -> new_bounds={new_bounds}")
     return {"new_bounds": new_bounds}
 
 
@@ -716,10 +843,37 @@ def run_session(
     target_energy_pj: Optional[float] = None,
     target_latency_ms: Optional[float] = None,
     allow_approximate_calibration: bool = False,
+    auto_hitl: bool = False,
+    auto_hitl_max_rounds: int = 2,
 ) -> None:
     register_hw_config(hw_config)
     graph = build_graph(checkpointer=checkpointer)
     config = {"configurable": {"thread_id": thread_id}}
+
+    auto_hitl_rounds_used = 0
+
+    def resolve_override(interrupt_payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """None means "stop the run instead" -- either --auto-hitl declined
+        to guess (auto_resolve_override) or its round cap is spent."""
+        if not auto_hitl:
+            return prompt_for_override(interrupt_payload)
+        nonlocal auto_hitl_rounds_used
+        if auto_hitl_rounds_used >= auto_hitl_max_rounds:
+            print(
+                f"\n[auto-hitl] round cap reached ({auto_hitl_max_rounds}); stopping instead of resolving "
+                f"further without researcher review. Resume with --thread-id {thread_id} (without --auto-hitl) "
+                "to take over manually."
+            )
+            return None
+        resolved = auto_resolve_override(interrupt_payload)
+        if resolved is None:
+            print(
+                "\n[auto-hitl] could not resolve this failure automatically (not a search-fixable target miss); "
+                f"stopping. Resume with --thread-id {thread_id} (without --auto-hitl) to review manually."
+            )
+            return None
+        auto_hitl_rounds_used += 1
+        return resolved
 
     snapshot = graph.get_state(config)
     if snapshot.values and not snapshot.next:
@@ -744,11 +898,15 @@ def run_session(
             f"(iteration_count={snapshot.values.get('iteration_count')})"
         )
         try:
-            resumable_input: Any = Command(resume=prompt_for_override(interrupt_payload))
+            override = resolve_override(interrupt_payload)
         except (EOFError, KeyboardInterrupt):
             print(f"\nNo researcher input received; session remains paused. Resume later with --thread-id {thread_id}.")
             write_dashboard(graph, config, dashboard_out)
             return
+        if override is None:
+            write_dashboard(graph, config, dashboard_out)
+            return
+        resumable_input: Any = Command(resume=override)
     else:
         print(
             f"\nStarting new AutoCIM-Agent session: model_id={model_id!r} "
@@ -785,13 +943,16 @@ def run_session(
         if interrupt_payload is None:
             break
         try:
-            override = prompt_for_override(interrupt_payload)
+            override = resolve_override(interrupt_payload)
         except (EOFError, KeyboardInterrupt):
             # stdin closed / researcher aborted mid-prompt: exit cleanly.
             # The checkpoint is already persisted at this interrupt (it was
             # written before hitl_node's interrupt() call returned control
             # here), so this is a soft pause, not a lost session.
             print(f"\nNo researcher input received; session paused. Resume later with --thread-id {thread_id}.")
+            write_dashboard(graph, config, dashboard_out)
+            return
+        if override is None:
             write_dashboard(graph, config, dashboard_out)
             return
         # Safe resume: only the dynamic interrupt()'s return value carries
@@ -853,6 +1014,8 @@ def main() -> None:
             target_energy_pj=args.target_energy_pj,
             target_latency_ms=args.target_latency_ms,
             allow_approximate_calibration=args.allow_approximate_calibration or allow_approximate_from_prompt,
+            auto_hitl=args.auto_hitl,
+            auto_hitl_max_rounds=args.auto_hitl_max_rounds,
         )
 
 
