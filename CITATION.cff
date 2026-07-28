@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "AutoCIM-Agent"
+abstract: >-
+  A LangGraph-based 6-agent HW-SW co-design optimization framework for
+  Compute-In-Memory (CIM) accelerators, jointly exploring quantization,
+  pruning, and crossbar mapping under hardware constraints.
+authors:
+  - name: "ong-labs"
+repository-code: "https://github.com/ong-labs/autocim-agent"
+license: BSD-3-Clause
+version: 0.1.0
+date-released: "2026-07-28"
+keywords:
+  - compute-in-memory
+  - hardware-software co-design
+  - LLM multi-agent
+  - neural network quantization
+  - design space exploration

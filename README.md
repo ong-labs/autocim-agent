@@ -199,3 +199,7 @@ tests/                        # pytest 스위트 (전부 stub 기반)
 docs/                         # 연구 계획서 등 부가 문서
 examples/hw_configs/          # --hw-config 예시 JSON
 ```
+
+## 라이선스
+
+[BSD-3-Clause](LICENSE). 이 프로젝트를 인용할 때는 [`CITATION.cff`](CITATION.cff)를 참고하세요.
