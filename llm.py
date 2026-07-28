@@ -2,11 +2,14 @@
 
 Provider/model choice is config-driven, mirroring CLAUDE.md 5.C's "load
 hardware specs via HWConfig, never hardcode" principle at the LLM boundary:
-set AUTOCIM_PLANNER_MODEL to any "<provider>:<model>" string
-`langchain.chat_models.init_chat_model` accepts, e.g.
-"anthropic:claude-sonnet-4-5-20250929" or "openai:gpt-4.1". No default
-model id is baked in here -- a provider swap is an env var change, not a
-code change, and callers never see a hallucinated/guessed model string.
+defaults to a local Ollama model (_DEFAULT_LOCAL_MODEL) so a fresh checkout
+never has to send hardware specs or candidate configs to a cloud API just to
+run -- IP-sensitive deployments (chip vendors) get that off-network guarantee
+for free. Set AUTOCIM_PLANNER_MODEL to any other "<provider>:<model>" string
+`langchain.chat_models.init_chat_model` accepts (e.g.
+"anthropic:claude-sonnet-4-5-20250929" or "openai:gpt-4.1") to opt into a
+cloud provider instead -- a provider swap is still just an env var change,
+not a code change.
 
 `invoke_with_retry` is the operational layer around that raw chat model,
 the LLM-call analogue of `middleware.wrap_tool_call`'s exception
@@ -52,17 +55,15 @@ from langchain.chat_models import init_chat_model
 from langchain_core.language_models import BaseChatModel
 
 _MODEL_ENV_VAR = "AUTOCIM_PLANNER_MODEL"
+# Local, tool-calling-verified default -- keeps hardware specs/candidate
+# configs off any network by default. Requires `ollama serve` running with
+# this model pulled (`ollama pull qwen2.5:7b`); set AUTOCIM_PLANNER_MODEL to
+# override with a cloud provider spec instead.
+_DEFAULT_LOCAL_MODEL = "ollama:qwen2.5:7b"
 
 
 def get_planner_chat_model() -> BaseChatModel:
-    model = os.environ.get(_MODEL_ENV_VAR)
-    if not model:
-        raise RuntimeError(
-            f"{_MODEL_ENV_VAR} is not set. Set it to a langchain "
-            "init_chat_model() spec, e.g. "
-            "'anthropic:claude-sonnet-4-5-20250929' (requires "
-            "ANTHROPIC_API_KEY) or 'openai:gpt-4.1' (requires OPENAI_API_KEY)."
-        )
+    model = os.environ.get(_MODEL_ENV_VAR) or _DEFAULT_LOCAL_MODEL
     return init_chat_model(model, temperature=0)
 
 
