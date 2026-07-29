@@ -11,7 +11,7 @@ exposing only `.invoke(messages)`, and `sleep_fn` is always a no-op so
 import pytest
 
 import llm
-from llm import LLMCallFailed, check_budget, get_planner_chat_model, invoke_with_retry
+from llm import LLMCallFailed, check_budget, get_planner_chat_model, invoke_with_retry, resolve_planner_model
 
 
 def test_get_planner_chat_model_defaults_to_local_ollama_when_env_unset(monkeypatch):
@@ -29,12 +29,54 @@ def test_get_planner_chat_model_defaults_to_local_ollama_when_env_unset(monkeypa
 
 def test_get_planner_chat_model_respects_env_override(monkeypatch):
     monkeypatch.setenv("AUTOCIM_PLANNER_MODEL", "anthropic:claude-sonnet-4-5-20250929")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-key")
     captured = {}
     monkeypatch.setattr(llm, "init_chat_model", lambda model, **kwargs: captured.update(model=model) or "fake-model")
 
     get_planner_chat_model()
 
     assert captured["model"] == "anthropic:claude-sonnet-4-5-20250929"
+
+
+def test_resolve_planner_model_falls_back_to_local_when_api_key_missing(monkeypatch):
+    # AUTOCIM_PLANNER_MODEL names a known cloud provider, but its API key
+    # env var is unset/empty -- most likely .env.example copied into
+    # .env.local with the provider filled in and the key left blank.
+    monkeypatch.setenv("AUTOCIM_PLANNER_MODEL", "anthropic:claude-sonnet-4-5-20250929")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    model, reason = resolve_planner_model()
+
+    assert model == "ollama:qwen2.5:7b"
+    assert reason is not None
+    assert "ANTHROPIC_API_KEY" in reason
+
+
+def test_resolve_planner_model_unset_env_has_no_fallback_reason(monkeypatch):
+    monkeypatch.delenv("AUTOCIM_PLANNER_MODEL", raising=False)
+    model, reason = resolve_planner_model()
+    assert model == "ollama:qwen2.5:7b"
+    assert reason is None
+
+
+def test_resolve_planner_model_unknown_provider_passes_through_unchecked(monkeypatch):
+    # A provider this project doesn't have a key-env mapping for (e.g. a
+    # local/self-hosted backend) is never blocked by this fallback.
+    monkeypatch.setenv("AUTOCIM_PLANNER_MODEL", "ollama:some-other-model")
+    model, reason = resolve_planner_model()
+    assert model == "ollama:some-other-model"
+    assert reason is None
+
+
+def test_get_planner_chat_model_uses_fallback_when_api_key_missing(monkeypatch):
+    monkeypatch.setenv("AUTOCIM_PLANNER_MODEL", "groq:llama-3.3-70b-versatile")
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    captured = {}
+    monkeypatch.setattr(llm, "init_chat_model", lambda model, **kwargs: captured.update(model=model) or "fake-model")
+
+    get_planner_chat_model()
+
+    assert captured["model"] == "ollama:qwen2.5:7b"
 
 
 class _FailNTimesThenSucceed:
