@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
+import main
 import nodes.planner as planner_module
 import observability
 import tools.simulators as simulators_module
@@ -32,6 +33,18 @@ def isolated_observability_log_dir(monkeypatch: pytest.MonkeyPatch, tmp_path) ->
     observability.reset_loggers()
     yield
     observability.reset_loggers()
+
+
+@pytest.fixture(autouse=True)
+def isolated_long_term_store(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """Every test gets its own long-term store DB (store.py's
+    SqliteLongTermStore, which main.py's run_session reads/writes for
+    cross-session learning) -- without this, every test that calls
+    run_session() would read/write the real repo's
+    `.cache/long_term_store.sqlite`, leaking test data into real runs and
+    letting one test's stored Pareto front/calibration factors bleed into
+    another test."""
+    monkeypatch.setattr(main, "DEFAULT_LONG_TERM_STORE_DB", tmp_path / "long_term_store.sqlite")
 
 
 def make_state(**overrides: Any) -> AutoCIMState:
