@@ -13,6 +13,7 @@ other test, since it's the one piece of startup behavior that only
 main() itself exercises.
 """
 
+import argparse
 import json
 import sys
 from datetime import datetime
@@ -97,26 +98,48 @@ def _feed_inputs(monkeypatch, values):
     monkeypatch.setattr("builtins.input", lambda prompt="": next(iterator))
 
 
-def test_prompt_custom_hw_config_builds_from_scripted_input(monkeypatch):
-    _feed_inputs(
-        monkeypatch,
-        ["my_custom_chip", "64", "64", "8", "4", "8", "ring", "20.0", "0.1", "0.02", "128.0"],
+def _wizard_args(target_accuracy=None, target_energy_pj=None, target_latency_ms=None, dashboard_out=None):
+    return argparse.Namespace(
+        target_accuracy=target_accuracy,
+        target_energy_pj=target_energy_pj,
+        target_latency_ms=target_latency_ms,
+        dashboard_out=dashboard_out,
     )
 
-    hw = main.prompt_custom_hw_config()
+
+# DEFAULT_HW_CONFIG has no exact calibration match (adc_bits=8 doesn't match
+# any KNOWN_REFERENCES entry), so every scripted-input sequence below that
+# reaches choice "3" (or blank-defaulted custom fields, which produce the
+# identical config) must also answer the approximate-calibration step.
+_DECLINE_APPROX = "n"
+
+
+def test_run_interactive_setup_custom_builds_from_scripted_input(monkeypatch):
+    # crossbar_rows/cols/adc_bits deliberately don't match any
+    # tools.calibration.KNOWN_REFERENCES entry (unlike a real 64x64/4-bit
+    # config), so the approx-calibration step stays in the chain here.
+    _feed_inputs(
+        monkeypatch,
+        ["1", "my_custom_chip", "64", "70", "8", "4", "8", "ring", "20.0", "0.1", "0.02", "128.0", _DECLINE_APPROX, "", "", "", "n", "y"],
+    )
+
+    result = main.run_interactive_setup(_wizard_args(), "abcd1234-5678")
+    hw = result[0]
 
     assert hw.hw_spec_id == "my_custom_chip"
     assert hw.crossbar_rows == 64
-    assert hw.crossbar_cols == 64
+    assert hw.crossbar_cols == 70
     assert hw.adc_bits == 4
     assert hw.noc_topology.value == "ring"
     assert hw.noc_link_bandwidth_gbps == 20.0
+    assert result[1] is False  # approx calibration declined
+    assert result[2:] == (None, None, None, None)  # targets ungated, no dashboard
 
 
-def test_prompt_custom_hw_config_uses_defaults_on_blank_input(monkeypatch):
-    _feed_inputs(monkeypatch, [""] * 11)
+def test_run_interactive_setup_custom_uses_defaults_on_blank_input(monkeypatch):
+    _feed_inputs(monkeypatch, ["1"] + [""] * 11 + [_DECLINE_APPROX, "", "", "", "n", "y"])
 
-    hw = main.prompt_custom_hw_config()
+    hw = main.run_interactive_setup(_wizard_args(), "abcd1234-5678")[0]
 
     assert hw.crossbar_rows == DEFAULT_HW_CONFIG.crossbar_rows
     assert hw.crossbar_cols == DEFAULT_HW_CONFIG.crossbar_cols
@@ -124,27 +147,27 @@ def test_prompt_custom_hw_config_uses_defaults_on_blank_input(monkeypatch):
     assert hw.hw_spec_id.startswith("custom_")
 
 
-def test_prompt_custom_hw_config_reprompts_on_invalid_noc_topology(monkeypatch, capsys):
+def test_run_interactive_setup_reprompts_on_invalid_noc_topology(monkeypatch, capsys):
     bad_pass = ["", "", "", "", "", "", "bogus", "", "", "", ""]  # 7th field is noc_topology
     good_pass = [""] * 11
-    _feed_inputs(monkeypatch, bad_pass + good_pass)
+    _feed_inputs(monkeypatch, ["1"] + bad_pass + good_pass + [_DECLINE_APPROX, "", "", "", "n", "y"])
 
-    hw = main.prompt_custom_hw_config()
+    hw = main.run_interactive_setup(_wizard_args(), "abcd1234-5678")[0]
 
     assert hw.noc_topology == DEFAULT_HW_CONFIG.noc_topology
     assert "다시 확인해주세요" in capsys.readouterr().out
 
 
-def test_prompt_custom_hw_config_reprompt_only_resets_the_offending_field(monkeypatch):
+def test_run_interactive_setup_validation_failure_resets_only_bad_field(monkeypatch):
     """A validation failure must only reset the *bad* field to its original
     default -- every other already-entered (valid) value must survive the
     restart, so the researcher isn't forced to retype fields that were
     already correct."""
     bad_pass = ["my_chip", "77", "77", "16", "8", "8", "bogus", "10.0", "0.1", "0.02", "128.0"]
-    fix_pass = ["", "", "", "", "", "", "", "", "", "", ""]  # blank noc_topology now falls back to a valid default
-    _feed_inputs(monkeypatch, bad_pass + fix_pass)
+    fix_pass = [""] * 11  # blank noc_topology now falls back to a valid default
+    _feed_inputs(monkeypatch, ["1"] + bad_pass + fix_pass + [_DECLINE_APPROX, "", "", "", "n", "y"])
 
-    hw = main.prompt_custom_hw_config()
+    hw = main.run_interactive_setup(_wizard_args(), "abcd1234-5678")[0]
 
     assert hw.hw_spec_id == "my_chip"
     assert hw.crossbar_rows == 77
@@ -153,126 +176,184 @@ def test_prompt_custom_hw_config_reprompt_only_resets_the_offending_field(monkey
     assert hw.noc_topology == DEFAULT_HW_CONFIG.noc_topology  # the one field that got reset
 
 
-def test_prompt_custom_hw_config_back_command_returns_to_the_previous_field(monkeypatch):
+def test_run_interactive_setup_back_returns_to_the_previous_field(monkeypatch):
     # hw_spec_id="", crossbar_rows="999" (typo), then "b" at crossbar_cols
     # steps back to redo crossbar_rows as "64"; everything else blank.
-    _feed_inputs(monkeypatch, ["", "999", "b", "64", ""] + [""] * 8)
+    _feed_inputs(
+        monkeypatch, ["1", "", "999", "b", "64", ""] + [""] * 8 + [_DECLINE_APPROX, "", "", "", "n", "y"]
+    )
 
-    hw = main.prompt_custom_hw_config()
+    hw = main.run_interactive_setup(_wizard_args(), "abcd1234-5678")[0]
 
     assert hw.crossbar_rows == 64
 
 
-def test_prompt_custom_hw_config_back_on_the_first_field_cancels(monkeypatch, capsys):
-    # "b" on the very first field (hw_spec_id) has nowhere earlier to go
-    # back to within this form -- it must cancel (return None) rather than
-    # silently re-showing the identical prompt, which would look like
-    # 'back' did nothing.
+def test_run_interactive_setup_back_across_the_custom_target_boundary(monkeypatch):
+    """'b' must reach backward across step-group boundaries -- from
+    target_accuracy (outside the custom-fields group) back into
+    sram_buffer_kb (the last custom field), not just within one group.
+    Step order here is: ...sram_buffer_kb -> approx_calibration_yn ->
+    target_accuracy -> ..., so reaching sram_buffer_kb from target_accuracy
+    takes two 'b's (one back into approx_calibration_yn, one more back into
+    sram_buffer_kb)."""
+    _feed_inputs(
+        monkeypatch,
+        ["1"] + [""] * 11 + [_DECLINE_APPROX, "b", "b", "999.0", _DECLINE_APPROX, "", "", "", "n", "y"],
+        # ^ approx-calib "n" -> target_accuracy "b" (-> approx_calibration_yn)
+        #   -> "b" again (-> sram_buffer_kb) -> "999.0" (new sram_buffer_kb)
+        #   -> approx-calib "n" again -> target_accuracy/energy/latency blank
+        #   -> dashboard "n" -> confirm "y"
+    )
+
+    result = main.run_interactive_setup(_wizard_args(), "abcd1234-5678")
+
+    assert result[0].sram_buffer_kb == 999.0
+    assert result[2:] == (None, None, None, None)
+
+
+def test_run_interactive_setup_back_on_the_first_step_exits(monkeypatch, capsys):
+    # 'b' at the very first step (hw_mode) has nowhere earlier to go --
+    # same as choice "4"/blank: exit rather than silently loop.
     _feed_inputs(monkeypatch, ["b"])
 
-    result = main.prompt_custom_hw_config()
-
-    assert result is None
-    assert "최상위 필드로 돌아갑니다" in capsys.readouterr().out
-
-
-def test_prompt_hw_config_from_examples_returns_the_selected_file(monkeypatch):
-    files = sorted(main.EXAMPLE_HW_CONFIGS_DIR.glob("*.json"))
-    _feed_inputs(monkeypatch, ["1"])
-
-    hw = main.prompt_hw_config_from_examples()
-
-    assert hw.hw_spec_id == main.load_hw_config(str(files[0])).hw_spec_id
-
-
-def test_prompt_hw_config_from_examples_returns_none_on_blank_input(monkeypatch):
-    _feed_inputs(monkeypatch, [""])
-    assert main.prompt_hw_config_from_examples() is None
-
-
-def test_prompt_hw_config_from_examples_returns_none_on_invalid_number(monkeypatch, capsys):
-    _feed_inputs(monkeypatch, ["9999"])
-    assert main.prompt_hw_config_from_examples() is None
-    assert "잘못된 선택" in capsys.readouterr().out
-
-
-def test_prompt_for_hw_config_default_choice_offers_approximate_when_unmatched(monkeypatch, capsys):
-    # "3" -> menu choice 3 (default); DEFAULT_HW_CONFIG has no exact match
-    # (its adc_bits=8 doesn't match the one 128x128 reference, adc_bits=7),
-    # so a second input (the approximate-calibration y/N prompt) is consumed.
-    _feed_inputs(monkeypatch, ["3", "n"])
-
-    hw, allow_approximate = main.prompt_for_hw_config()
-
-    assert hw.hw_spec_id == DEFAULT_HW_CONFIG.hw_spec_id
-    assert allow_approximate is False
-    assert "가장 가까운 레퍼런스" in capsys.readouterr().out
-
-
-def test_prompt_for_hw_config_accepts_approximate_calibration_on_yes(monkeypatch):
-    _feed_inputs(monkeypatch, ["3", "y"])
-    _hw, allow_approximate = main.prompt_for_hw_config()
-    assert allow_approximate is True
-
-
-def test_prompt_for_hw_config_blank_choice_exits(monkeypatch, capsys):
-    # Blank input now defaults to menu choice 4 (종료), not 3 (기본값) --
-    # a researcher who doesn't know what to pick shouldn't be silently
-    # dropped into a run using a hw_spec they never chose.
-    _feed_inputs(monkeypatch, [""])
-
     with pytest.raises(SystemExit) as exc_info:
-        main.prompt_for_hw_config()
-
-    assert exc_info.value.code == 0
-    assert "입력이 없습니다" in capsys.readouterr().out
-
-
-def test_prompt_for_hw_config_choice_4_exits(monkeypatch, capsys):
-    _feed_inputs(monkeypatch, ["4"])
-
-    with pytest.raises(SystemExit) as exc_info:
-        main.prompt_for_hw_config()
+        main.run_interactive_setup(_wizard_args(), "abcd1234-5678")
 
     assert exc_info.value.code == 0
     assert "종료합니다" in capsys.readouterr().out
 
 
-def test_prompt_for_hw_config_exact_match_skips_the_approximate_prompt(monkeypatch, capsys):
+def test_run_interactive_setup_example_file_choice(monkeypatch):
     files = sorted(main.EXAMPLE_HW_CONFIGS_DIR.glob("*.json"))
     index = next(i for i, f in enumerate(files, 1) if f.name == "calibrated_neurosim_v1_5.json")
-    # Only two inputs queued (menu choice "2", then the file number) -- a
-    # third input() call (i.e. an unwanted approximate-calibration prompt
-    # for an already-exact match) would raise StopIteration and fail the test.
-    _feed_inputs(monkeypatch, ["2", str(index)])
+    # calibrated_neurosim_v1_5.json is an exact calibration match, so no
+    # approx-calibration input is consumed here -- a third input() call
+    # would raise StopIteration and fail the test.
+    _feed_inputs(monkeypatch, ["2", str(index), "", "", "", "n", "y"])
 
-    hw, allow_approximate = main.prompt_for_hw_config()
+    result = main.run_interactive_setup(_wizard_args(), "abcd1234-5678")
 
-    assert hw.hw_spec_id == "calibrated_neurosim_v1_5"
-    assert allow_approximate is False
-    assert "exact match" in capsys.readouterr().out
-
-
-def test_prompt_for_hw_config_reshows_menu_when_custom_entry_is_cancelled(monkeypatch):
-    # "1" -> custom entry; "b" on hw_spec_id cancels back to the menu;
-    # "3" -> default this time; "n" -> decline the approximate-calibration
-    # offer (DEFAULT_HW_CONFIG has no exact match).
-    _feed_inputs(monkeypatch, ["1", "b", "3", "n"])
-
-    hw, allow_approximate = main.prompt_for_hw_config()
-
-    assert hw.hw_spec_id == DEFAULT_HW_CONFIG.hw_spec_id
-    assert allow_approximate is False
+    assert result[0].hw_spec_id == "calibrated_neurosim_v1_5"
+    assert result[1] is False
 
 
-def test_prompt_for_hw_config_falls_back_to_default_on_eof(monkeypatch, capsys):
-    monkeypatch.setattr("builtins.input", lambda prompt="": (_ for _ in ()).throw(EOFError()))
+def test_run_interactive_setup_blank_choice_exits(monkeypatch, capsys):
+    # Blank input at hw_mode now defaults to menu choice 4 (종료), not 3
+    # (기본값) -- a researcher who doesn't know what to pick shouldn't be
+    # silently dropped into a run using a hw_spec they never chose.
+    _feed_inputs(monkeypatch, [""])
 
-    hw, allow_approximate = main.prompt_for_hw_config()
+    with pytest.raises(SystemExit) as exc_info:
+        main.run_interactive_setup(_wizard_args(), "abcd1234-5678")
 
-    assert hw is DEFAULT_HW_CONFIG
-    assert allow_approximate is False
-    assert "기본값을 사용" in capsys.readouterr().out
+    assert exc_info.value.code == 0
+    assert "입력이 없습니다" in capsys.readouterr().out
+
+
+def test_run_interactive_setup_choice_4_exits(monkeypatch, capsys):
+    _feed_inputs(monkeypatch, ["4"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        main.run_interactive_setup(_wizard_args(), "abcd1234-5678")
+
+    assert exc_info.value.code == 0
+    assert "종료합니다" in capsys.readouterr().out
+
+
+def test_run_interactive_setup_offers_approximate_when_unmatched(monkeypatch, capsys):
+    _feed_inputs(monkeypatch, ["3", _DECLINE_APPROX, "", "", "", "n", "y"])
+
+    result = main.run_interactive_setup(_wizard_args(), "abcd1234-5678")
+
+    assert result[0].hw_spec_id == DEFAULT_HW_CONFIG.hw_spec_id
+    assert result[1] is False
+    assert "가장 가까운 레퍼런스" in capsys.readouterr().out
+
+
+def test_run_interactive_setup_accepts_approximate_calibration_on_yes(monkeypatch):
+    _feed_inputs(monkeypatch, ["3", "y", "", "", "", "n", "y"])
+    result = main.run_interactive_setup(_wizard_args(), "abcd1234-5678")
+    assert result[1] is True
+
+
+def test_run_interactive_setup_targets_skip_fields_given_on_the_cli(monkeypatch):
+    # Only target_latency_ms is unset -- a single numeric input is queued
+    # for it, so an extra unwanted target prompt would raise StopIteration.
+    _feed_inputs(monkeypatch, ["3", _DECLINE_APPROX, "5.0", "n", "y"])
+
+    result = main.run_interactive_setup(_wizard_args(target_accuracy=0.7, target_energy_pj=2000.0), "abcd1234-5678")
+
+    assert result[2:5] == (0.7, 2000.0, 5.0)
+
+
+def test_run_interactive_setup_targets_all_given_skips_prompting_entirely(monkeypatch):
+    _feed_inputs(monkeypatch, ["3", _DECLINE_APPROX, "n", "y"])  # no target prompts queued
+    result = main.run_interactive_setup(
+        _wizard_args(target_accuracy=0.7, target_energy_pj=2000.0, target_latency_ms=5.0), "abcd1234-5678"
+    )
+    assert result[2:5] == (0.7, 2000.0, 5.0)
+
+
+def test_run_interactive_setup_dashboard_yes_writes_under_report_dir(monkeypatch):
+    class _FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 7, 28, 15, 4, 5)
+
+    monkeypatch.setattr(main, "datetime", _FixedDatetime)
+    _feed_inputs(monkeypatch, ["3", _DECLINE_APPROX, "", "", "", "y", "", "y"])
+
+    result = main.run_interactive_setup(_wizard_args(), "abcd1234-5678")
+
+    assert result[5] == str(main.REPORT_DIR / "report_cim_v1_128x128_abcd1234_20260728_150405.html")
+
+
+def test_run_interactive_setup_confirm_back_returns_to_last_step(monkeypatch):
+    # At confirm, "b" steps back into dashboard_yn ("n" -> "y" the second
+    # time), rather than re-walking the whole chain from the top.
+    _feed_inputs(monkeypatch, ["3", _DECLINE_APPROX, "", "", "", "n", "b", "y", "", "y"])
+
+    result = main.run_interactive_setup(_wizard_args(), "abcd1234-5678")
+
+    assert result[5] is not None  # dashboard path was written after all
+
+
+def test_run_interactive_setup_confirm_jump_to_field_edits_and_returns(monkeypatch):
+    # From confirm, typing "3" (crossbar_rows's listed number for the
+    # custom-entry path) jumps straight there instead of walking back one
+    # step at a time; every other already-entered answer must survive.
+    _feed_inputs(
+        monkeypatch,
+        ["1"]
+        + [""] * 11  # hw_spec_id..sram_buffer_kb (11 fields)
+        + [_DECLINE_APPROX, "0.7", "", "", "n"]  # approx-calib, 3 targets, dashboard_yn -> confirm screen
+        + ["3", "256"]  # confirm: jump to [3] crossbar_rows, enter 256
+        + [""] * 9  # crossbar_cols..sram_buffer_kb re-confirmed blank (9 fields)
+        + ["", "", "", "", "", "y"],  # approx-calib, 3 targets, dashboard_yn re-confirmed blank, then proceed
+    )
+
+    result = main.run_interactive_setup(_wizard_args(), "abcd1234-5678")
+
+    assert result[0].crossbar_rows == 256
+    assert result[2] == 0.7  # target_accuracy survived the jump-edit round-trip
+
+
+def test_run_interactive_setup_eof_proceeds_with_partial_answers(monkeypatch):
+    values = iter(["3", _DECLINE_APPROX, "0.7"])
+
+    def fake_input(prompt=""):
+        try:
+            return next(values)
+        except StopIteration:
+            raise EOFError()
+
+    monkeypatch.setattr("builtins.input", fake_input)
+
+    result = main.run_interactive_setup(_wizard_args(), "abcd1234-5678")
+
+    assert result[0].hw_spec_id == DEFAULT_HW_CONFIG.hw_spec_id
+    assert result[2] == 0.7  # entered before EOF -- not discarded
+    assert result[5] is None  # never reached the dashboard step
 
 
 def test_prompt_for_dashboard_out_declines_by_default(monkeypatch):
@@ -305,58 +386,27 @@ def test_prompt_for_dashboard_out_falls_back_to_none_on_eof(monkeypatch):
     assert main.prompt_for_dashboard_out("cim_v1_128x128", "abcd1234-5678") is None
 
 
-def test_prompt_for_targets_blank_leaves_everything_ungated(monkeypatch):
-    _feed_inputs(monkeypatch, ["", "", ""])
-    assert main.prompt_for_targets(None, None, None) == (None, None, None)
+def test_run_interactive_setup_skips_dashboard_prompt_when_dashboard_out_given(monkeypatch):
+    # --dashboard-out already given on the CLI -- the dashboard_yn/path
+    # steps must not even be in the chain (a queued extra input would raise
+    # StopIteration if they were).
+    _feed_inputs(monkeypatch, ["3", _DECLINE_APPROX, "", "", "", "y"])
+
+    result = main.run_interactive_setup(
+        _wizard_args(dashboard_out="/tmp/explicit_report.html"), "abcd1234-5678"
+    )
+
+    assert result[5] == "/tmp/explicit_report.html"
 
 
-def test_prompt_for_targets_parses_entered_numbers(monkeypatch):
-    _feed_inputs(monkeypatch, ["0.7", "2000", "5.0"])
-    assert main.prompt_for_targets(None, None, None) == (0.7, 2000.0, 5.0)
-
-
-def test_prompt_for_targets_reprompts_on_unparseable_input(monkeypatch, capsys):
-    _feed_inputs(monkeypatch, ["not-a-number", "0.7", "", ""])
-    assert main.prompt_for_targets(None, None, None) == (0.7, None, None)
-    assert "숫자를 입력하거나" in capsys.readouterr().out
-
-
-def test_prompt_for_targets_skips_fields_already_given_on_the_cli(monkeypatch):
-    # Only target_latency_ms is unset -- a single input() call is queued, so
-    # a second call (e.g. re-asking for target_accuracy/target_energy_pj)
-    # would raise StopIteration and fail the test.
-    _feed_inputs(monkeypatch, ["5.0"])
-    assert main.prompt_for_targets(0.7, 2000.0, None) == (0.7, 2000.0, 5.0)
-
-
-def test_prompt_for_targets_all_given_skips_prompting_entirely(monkeypatch):
-    monkeypatch.setattr("builtins.input", lambda prompt="": (_ for _ in ()).throw(AssertionError("must not prompt")))
-    assert main.prompt_for_targets(0.7, 2000.0, 5.0) == (0.7, 2000.0, 5.0)
-
-
-def test_prompt_for_targets_eof_keeps_already_entered_values(monkeypatch):
-    values = iter(["0.7"])
-
-    def fake_input(prompt=""):
-        try:
-            return next(values)
-        except StopIteration:
-            raise EOFError()
-
-    monkeypatch.setattr("builtins.input", fake_input)
-    assert main.prompt_for_targets(None, None, None) == (0.7, None, None)
-
-
-def test_main_invokes_interactive_prompt_when_hw_config_omitted_and_stdin_is_a_tty(monkeypatch, tmp_path):
+def test_main_invokes_interactive_setup_when_hw_config_omitted_and_stdin_is_a_tty(monkeypatch, tmp_path):
     calls = {}
 
-    def fake_prompt():
+    def fake_setup(args, thread_id):
         calls["invoked"] = True
-        return DEFAULT_HW_CONFIG, False
+        return DEFAULT_HW_CONFIG, False, None, None, None, None
 
-    monkeypatch.setattr(main, "prompt_for_hw_config", fake_prompt)
-    monkeypatch.setattr(main, "prompt_for_targets", lambda a, e, l: (a, e, l))
-    monkeypatch.setattr(main, "prompt_for_dashboard_out", lambda hw_spec_id, thread_id: None)
+    monkeypatch.setattr(main, "run_interactive_setup", fake_setup)
     monkeypatch.setattr(main, "run_session", lambda *args, **kwargs: None)
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
     monkeypatch.setattr("sys.argv", ["main.py", "--checkpoint-db", str(tmp_path / "checkpoints.sqlite")])
@@ -366,11 +416,11 @@ def test_main_invokes_interactive_prompt_when_hw_config_omitted_and_stdin_is_a_t
     assert calls.get("invoked") is True
 
 
-def test_main_skips_interactive_prompt_when_hw_config_is_given(monkeypatch, tmp_path):
-    def fail_if_called():
-        raise AssertionError("prompt_for_hw_config must not be called when --hw-config is given")
+def test_main_skips_interactive_setup_when_hw_config_is_given(monkeypatch, tmp_path):
+    def fail_if_called(args, thread_id):
+        raise AssertionError("run_interactive_setup must not be called when --hw-config is given")
 
-    monkeypatch.setattr(main, "prompt_for_hw_config", fail_if_called)
+    monkeypatch.setattr(main, "run_interactive_setup", fail_if_called)
     monkeypatch.setattr(main, "prompt_for_dashboard_out", lambda hw_spec_id, thread_id: None)
     monkeypatch.setattr(main, "run_session", lambda *args, **kwargs: None)
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
@@ -385,14 +435,14 @@ def test_main_skips_interactive_prompt_when_hw_config_is_given(monkeypatch, tmp_
         ],
     )
 
-    main.main()  # must not raise (prompt_for_hw_config would if called)
+    main.main()  # must not raise (run_interactive_setup would if called)
 
 
-def test_main_skips_interactive_prompt_when_stdin_is_not_a_tty(monkeypatch, tmp_path):
-    def fail_if_called():
-        raise AssertionError("prompt_for_hw_config must not be called when stdin isn't a tty")
+def test_main_skips_interactive_setup_when_stdin_is_not_a_tty(monkeypatch, tmp_path):
+    def fail_if_called(args, thread_id):
+        raise AssertionError("run_interactive_setup must not be called when stdin isn't a tty")
 
-    monkeypatch.setattr(main, "prompt_for_hw_config", fail_if_called)
+    monkeypatch.setattr(main, "run_interactive_setup", fail_if_called)
     monkeypatch.setattr(main, "run_session", lambda *args, **kwargs: None)
     monkeypatch.setattr("sys.stdin.isatty", lambda: False)
     monkeypatch.setattr("sys.argv", ["main.py", "--checkpoint-db", str(tmp_path / "checkpoints.sqlite")])
@@ -400,31 +450,39 @@ def test_main_skips_interactive_prompt_when_stdin_is_not_a_tty(monkeypatch, tmp_
     main.main()  # must not raise
 
 
-def test_main_invokes_dashboard_prompt_when_dashboard_out_omitted_and_stdin_is_a_tty(monkeypatch, tmp_path):
+def test_main_invokes_dashboard_prompt_when_hw_config_given_and_dashboard_out_omitted(monkeypatch, tmp_path):
+    # --hw-config given (so run_interactive_setup is skipped entirely) but
+    # --dashboard-out omitted with a real tty -- the standalone
+    # prompt_for_dashboard_out path (unchanged) must still fire.
     calls = {}
 
     def fake_prompt(hw_spec_id, thread_id):
         calls["invoked"] = True
         return None
 
-    monkeypatch.setattr(main, "prompt_for_hw_config", lambda: (DEFAULT_HW_CONFIG, False))
-    monkeypatch.setattr(main, "prompt_for_targets", lambda a, e, l: (a, e, l))
     monkeypatch.setattr(main, "prompt_for_dashboard_out", fake_prompt)
     monkeypatch.setattr(main, "run_session", lambda *args, **kwargs: None)
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
-    monkeypatch.setattr("sys.argv", ["main.py", "--checkpoint-db", str(tmp_path / "checkpoints.sqlite")])
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "main.py",
+            "--hw-config",
+            "examples/hw_configs/default_cim_v1_128x128.json",
+            "--checkpoint-db",
+            str(tmp_path / "checkpoints.sqlite"),
+        ],
+    )
 
     main.main()
 
     assert calls.get("invoked") is True
 
 
-def test_main_skips_dashboard_prompt_when_dashboard_out_is_given(monkeypatch, tmp_path):
+def test_main_skips_dashboard_prompt_when_hw_config_and_dashboard_out_both_given(monkeypatch, tmp_path):
     def fail_if_called(hw_spec_id, thread_id):
         raise AssertionError("prompt_for_dashboard_out must not be called when --dashboard-out is given")
 
-    monkeypatch.setattr(main, "prompt_for_hw_config", lambda: (DEFAULT_HW_CONFIG, False))
-    monkeypatch.setattr(main, "prompt_for_targets", lambda a, e, l: (a, e, l))
     monkeypatch.setattr(main, "prompt_for_dashboard_out", fail_if_called)
     monkeypatch.setattr(main, "run_session", lambda *args, **kwargs: None)
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
@@ -432,6 +490,8 @@ def test_main_skips_dashboard_prompt_when_dashboard_out_is_given(monkeypatch, tm
         "sys.argv",
         [
             "main.py",
+            "--hw-config",
+            "examples/hw_configs/default_cim_v1_128x128.json",
             "--dashboard-out",
             str(tmp_path / "report.html"),
             "--checkpoint-db",
