@@ -21,6 +21,15 @@ def hitl_node(state: AutoCIMState) -> Dict[str, Any]:
             "retry_count": state.get("retry_count", 0),
             "failure_history": state.get("failure_history", []),
             "latest_metrics": state.get("metrics_store", {}),
+            # hw_spec_id + targets: main.py's suggest_override_bounds() needs
+            # these to size its suggestion against how far off target the
+            # candidate actually is, capped at this hw_spec's real ADC/DAC
+            # bit ceiling -- neither was in this payload before, so that
+            # suggestion was a fixed step regardless of how big the miss was.
+            "hw_spec_id": state.get("hw_spec_id"),
+            "target_accuracy": state.get("target_accuracy"),
+            "target_energy_pj": state.get("target_energy_pj"),
+            "target_latency_ms": state.get("target_latency_ms"),
         }
     )
 
