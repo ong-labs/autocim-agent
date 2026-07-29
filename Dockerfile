@@ -7,10 +7,13 @@ FROM python:3.13-slim
 
 WORKDIR /app
 
-# torch/torchvision from PyPI's default index pull in CUDA wheels
-# (multi-GB, unneeded here) -- installed first from the CPU-only index at
-# the exact pinned version from requirements.txt so the later full install
-# is a no-op for these two packages instead of re-downloading the CUDA build.
+# Which torch/torchvision wheel (CPU-only vs CUDA, multi-GB) you get depends
+# entirely on which index you install from -- never rely on a bare `pip
+# install` to pick the right one. Installed first, explicitly from the
+# CPU-only index (this container can't use a GPU anyway -- see the image
+# comment above) at the exact pinned version from requirements.txt, so the
+# later full install is a no-op for these two packages instead of pulling a
+# different, unwanted wheel.
 COPY requirements.txt .
 RUN pip install --no-cache-dir torch==2.13.0 torchvision==0.28.0 --index-url https://download.pytorch.org/whl/cpu \
     && pip install --no-cache-dir -r requirements.txt
