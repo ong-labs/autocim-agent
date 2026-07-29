@@ -7,7 +7,7 @@ schema-valid JSON:
 
 | File | Use it to see... |
 |---|---|
-| `cim_v1_128x128.json` | The default config `main.py` uses when `--hw-config` is omitted -- a reasonable starting template. Uncalibrated (`adc_bits=8` doesn't match any `tools/calibration.py` reference) and converges immediately. |
+| `default_cim_v1_128x128.json` | The default config `main.py` uses when `--hw-config` is omitted -- a reasonable starting template. Uncalibrated (`adc_bits=8` doesn't match any `tools/calibration.py` reference) and converges immediately. |
 | `high_ir_drop_never_converges.json` | `wire_resistance_ohm_per_um=5.0` pushes `ir_drop_error_pct` past `verifier_tool`'s 5% convergence bound -- the run will hit HITL after `MAX_RETRY_LIMIT` (nodes/evaluator.py) retries instead of converging, useful for exercising/demoing that flow. |
 
 ## Calibrated configs (real literature/silicon data)
@@ -19,7 +19,7 @@ against real (mostly silicon-measured) data instead of the uncalibrated
 default (factor 1.0). No hand-editing of `crossbar_rows`/`cols`/`adc_bits`
 needed; the other fields (`num_tiles`, `dac_bits`, `noc_topology`,
 `wire_resistance_ohm_per_um`, etc.) are filled with the same reasonable
-defaults `cim_v1_128x128.json` uses, since `KNOWN_REFERENCES` doesn't
+defaults `default_cim_v1_128x128.json` uses, since `KNOWN_REFERENCES` doesn't
 constrain them. Session start prints `[calibration] exact match` to confirm.
 
 | File | Reference (`tools/calibration.py`) | Array | ADC | Tech |
