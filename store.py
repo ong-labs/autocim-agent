@@ -17,8 +17,11 @@ or any node/tool code that depends on them.
 from __future__ import annotations
 
 import abc
+import json
+import sqlite3
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from state import merge_dicts
 
@@ -82,6 +85,70 @@ class InMemoryLongTermStore(BaseLongTermStore):
 
         results.sort(key=lambda r: r.score or 0.0, reverse=True)
         return results[:limit]
+
+
+class SqliteLongTermStore(BaseLongTermStore):
+    """File-backed persistent implementation -- unlike `InMemoryLongTermStore`,
+    survives across separate `python main.py` invocations, which is the
+    whole point of a *long-term* store (main.py's `run_session` reads this
+    at the start of a fresh session and writes to it when one ends/pauses).
+    One `(namespace, key) -> JSON value` table; `search` still ranks by
+    token overlap in Python rather than a real embedding index (same
+    approach as `InMemoryLongTermStore`) -- fine at this project's data
+    volume (one row per model_id/hw_spec_id, not millions), and avoids a
+    new vector-DB dependency for what's still a Mock-First-scoped feature
+    (CLAUDE.md 5.D)."""
+
+    def __init__(self, db_path: Union[str, Path]) -> None:
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(str(db_path))
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS long_term_store ("
+            "namespace TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, "
+            "PRIMARY KEY (namespace, key))"
+        )
+        self._conn.commit()
+
+    @staticmethod
+    def _namespace_key(namespace: Namespace) -> str:
+        return "/".join(namespace)
+
+    def get(self, namespace: Namespace, key: str) -> Optional[Dict[str, Any]]:
+        row = self._conn.execute(
+            "SELECT value FROM long_term_store WHERE namespace = ? AND key = ?",
+            (self._namespace_key(namespace), key),
+        ).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def put(self, namespace: Namespace, key: str, value: Dict[str, Any]) -> None:
+        self._conn.execute(
+            "INSERT INTO long_term_store (namespace, key, value) VALUES (?, ?, ?) "
+            "ON CONFLICT(namespace, key) DO UPDATE SET value = excluded.value",
+            (self._namespace_key(namespace), key, json.dumps(value)),
+        )
+        self._conn.commit()
+
+    def search(self, namespace_prefix: Namespace, query: str, limit: int = 5) -> List[SearchResult]:
+        prefix = self._namespace_key(namespace_prefix)
+        rows = self._conn.execute(
+            "SELECT namespace, key, value FROM long_term_store WHERE namespace = ? OR namespace LIKE ?",
+            (prefix, f"{prefix}/%"),
+        ).fetchall()
+        query_tokens = set(query.lower().split())
+        results: List[SearchResult] = []
+        for namespace_str, key, value_json in rows:
+            value = json.loads(value_json)
+            value_tokens = set(" ".join(str(v) for v in value.values()).lower().split())
+            overlap = len(query_tokens & value_tokens)
+            if overlap == 0:
+                continue
+            score = overlap / max(len(query_tokens), 1)
+            results.append(SearchResult(namespace=tuple(namespace_str.split("/")), key=key, value=value, score=score))
+        results.sort(key=lambda r: r.score or 0.0, reverse=True)
+        return results[:limit]
+
+    def close(self) -> None:
+        self._conn.close()
 
 
 class ModelSpecificStore:
