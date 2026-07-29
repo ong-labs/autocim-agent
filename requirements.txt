@@ -10,15 +10,16 @@ langgraph==1.2.9
 langgraph-checkpoint-sqlite==3.1.0
 pydantic==2.13.2
 # torch/torchvision: version pinned here, but the actual wheel (CPU-only
-# vs. CUDA-enabled) is determined by which index you install from -- `pip
-# install -r requirements.txt` alone resolves to whatever PyPI's default
-# index gives for your platform (historically the CPU-only build on
-# Windows). For a CUDA-enabled install (tools/qat.py auto-detects and uses
-# the GPU via AUTOCIM_QAT_DEVICE if present), install these two first from
-# the matching PyTorch CUDA index, e.g.:
-#   pip install torch==2.13.0 torchvision==0.28.0 --index-url https://download.pytorch.org/whl/cu130
+# vs. CUDA-enabled) is determined entirely by which index you install from
+# -- a bare `pip install -r requirements.txt` gives whatever PyPI's default
+# index resolves to, which varies by platform/pip version and isn't
+# something to rely on either way. Pin down which you get explicitly:
+#   CPU-only:   pip install torch==2.13.0 torchvision==0.28.0 --index-url https://download.pytorch.org/whl/cpu
+#   CUDA-enabled: pip install torch==2.13.0 torchvision==0.28.0 --index-url https://download.pytorch.org/whl/cu130
 # then run this file's install as normal (pip won't redownload them since
-# the version number already matches). See README.md.
+# the version number already matches) -- tools/qat.py auto-detects and uses
+# a GPU via AUTOCIM_QAT_DEVICE if the CUDA build is what's installed. See
+# README.md's "문제 해결" section for how to check which one you actually have.
 torch==2.13.0
 torchvision==0.28.0
 timm==1.0.28
