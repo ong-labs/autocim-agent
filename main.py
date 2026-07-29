@@ -71,6 +71,11 @@ DEFAULT_HW_CONFIG = HWConfig(
 
 DEFAULT_CHECKPOINT_DB = Path(__file__).resolve().parent / ".cache" / "checkpoints.sqlite"
 EXAMPLE_HW_CONFIGS_DIR = Path(__file__).resolve().parent / "examples" / "hw_configs"
+# prompt_for_dashboard_out's auto-generated report filenames land here
+# instead of the repo root, so back-to-back interactive runs don't scatter
+# report_*.html files next to main.py -- an explicit --dashboard-out PATH is
+# unaffected (it's written exactly where given, as before).
+REPORT_DIR = Path(__file__).resolve().parent / "report"
 
 
 def parse_args() -> argparse.Namespace:
@@ -348,7 +353,7 @@ def prompt_custom_hw_config() -> Optional[HWConfig]:
             result = read_fn(values[name])
             if result is _BACK:
                 if index == 0:
-                    print("첫 번째 필드입니다 -- 이전 메뉴로 돌아갑니다.")
+                    print("\n최상위 필드로 돌아갑니다.")
                     return None
                 index -= 1
                 continue
@@ -417,16 +422,23 @@ def prompt_for_hw_config() -> Tuple[HWConfig, bool]:
     try:
         hw_config: Optional[HWConfig] = None
         while hw_config is None:
-            print("\n--hw-config가 지정되지 않았습니다. 어떻게 진행할까요?")
-            print("  [1] 직접 값 입력 (커스텀 HWConfig)")
+            print("--hw-config가 지정되지 않았습니다. 어떻게 진행할까요?\n")
+            print("  [1] 직접 값 입력 (Custom HWConfig)")
             print("  [2] 저장된 예시 파일 사용")
             print("  [3] 기본값 사용")
-            choice = input("선택 [3]: ").strip() or "3"
+            print("  [4] 종료")
+            raw_choice = input("\n 선택: ").strip()
+            choice = raw_choice or "4"
 
             if choice == "1":
                 hw_config = prompt_custom_hw_config()  # None if cancelled via 'back' on the first field -> loop, re-show menu
             elif choice == "2":
                 hw_config = prompt_hw_config_from_examples() or DEFAULT_HW_CONFIG
+            elif choice == "3":
+                hw_config = DEFAULT_HW_CONFIG
+            elif choice == "4":
+                print("\n입력이 없습니다.\n실행을 종료합니다." if not raw_choice else "\n종료합니다.")
+                raise SystemExit(0)
             else:
                 hw_config = DEFAULT_HW_CONFIG
     except (EOFError, KeyboardInterrupt):
@@ -453,6 +465,59 @@ def prompt_for_hw_config() -> Tuple[HWConfig, bool]:
     except (EOFError, KeyboardInterrupt):
         answer = ""
     return hw_config, answer == "y"
+
+
+def _read_optional_float(label: str) -> Optional[float]:
+    """One target-metric prompt: blank -> None (ungated), a number -> that
+    target. Loops on unparseable non-blank input instead of silently
+    discarding a typo as "ungated"."""
+    while True:
+        raw = input(f"{label} (빈칸=미설정): ").strip()
+        if not raw:
+            return None
+        try:
+            return float(raw)
+        except ValueError:
+            print("  숫자를 입력하거나 빈칸으로 두세요.")
+
+
+def prompt_for_targets(
+    target_accuracy: Optional[float],
+    target_energy_pj: Optional[float],
+    target_latency_ms: Optional[float],
+) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """Interactive target-accuracy/energy/latency picker -- main() calls this
+    right after prompt_for_hw_config() (any of its [1]/[2]/[3] branches), so
+    it's not skippable by picking one hw_spec source over another: all three
+    leave every target ungated by default, and nodes/evaluator.py's
+    is_converged only checks a configured target -- with none configured, a
+    candidate that merely clears @verifier's physical IR-drop/noise check
+    (accuracy/energy/latency notwithstanding) still gets reported
+    "Converged". Only prompts for whichever of the three wasn't already
+    passed on the command line; a value already given via
+    --target-accuracy/--target-energy-pj/--target-latency-ms is never
+    overridden here. EOFError/KeyboardInterrupt leaves whatever hasn't been
+    answered yet as ungated (None), same non-destructive-fallback spirit as
+    prompt_for_hw_config/prompt_for_override -- it does not discard targets
+    already entered before the interrupt."""
+    if target_accuracy is not None and target_energy_pj is not None and target_latency_ms is not None:
+        return target_accuracy, target_energy_pj, target_latency_ms
+
+    print(
+        "\n--target-accuracy/--target-energy-pj/--target-latency-ms가 지정되지 않았습니다.\n"
+        "값을 입력하면 그 기준을 만족해야 '수렴'으로 인정되고, 빈칸으로 두면 물리적 HW 검증\n"
+        "(IR-drop/노이즈)만으로 수렴 판정됩니다."
+    )
+    try:
+        if target_accuracy is None:
+            target_accuracy = _read_optional_float("target accuracy (예: 0.7)")
+        if target_energy_pj is None:
+            target_energy_pj = _read_optional_float("target energy_pj (예: 2000)")
+        if target_latency_ms is None:
+            target_latency_ms = _read_optional_float("target latency_ms (예: 5.0)")
+    except (EOFError, KeyboardInterrupt):
+        print("\n입력을 받지 못해 나머지 target은 미설정(빈칸)으로 둡니다.")
+    return target_accuracy, target_energy_pj, target_latency_ms
 
 
 def build_initial_state(
@@ -630,8 +695,9 @@ def prompt_for_dashboard_out(hw_spec_id: str, thread_id: str) -> Optional[str]:
     prompt_for_hw_config so a scripted/CI invocation never sees it. Default
     filename is derived from hw_spec_id + thread_id (already unique per
     fresh session) so back-to-back interactive runs never clobber each
-    other's report. EOFError/KeyboardInterrupt falls back to None (no
-    report), matching prompt_for_hw_config's non-destructive fallback.
+    other's report, and lands under REPORT_DIR instead of the repo root.
+    EOFError/KeyboardInterrupt falls back to None (no report), matching
+    prompt_for_hw_config's non-destructive fallback.
     """
     try:
         answer = input("\n리포트(HTML 대시보드)를 생성할까요? [Y/N]: ").strip().lower()
@@ -639,12 +705,13 @@ def prompt_for_dashboard_out(hw_spec_id: str, thread_id: str) -> Optional[str]:
         return None
     if answer != "y":
         return None
-    default_name = f"report_{hw_spec_id}_{thread_id[:8]}_{datetime.now():%Y%m%d_%H%M%S}.html"
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    default_path = REPORT_DIR / f"report_{hw_spec_id}_{thread_id[:8]}_{datetime.now():%Y%m%d_%H%M%S}.html"
     try:
-        raw = input(f"저장 경로 [{default_name}]: ").strip()
+        raw = input(f"저장 경로 [{default_path}]: ").strip()
     except (EOFError, KeyboardInterrupt):
         raw = ""
-    return raw or default_name
+    return raw or str(default_path)
 
 
 def _truncate(text: Optional[str], max_chars: int = 80) -> str:
@@ -989,10 +1056,33 @@ def main() -> None:
             # (not a script/CI pipe) -- offer the interactive picker instead
             # of silently falling back to DEFAULT_HW_CONFIG. Passing
             # --hw-config explicitly (any value) always skips this, so
-            # existing scripts/automation are unaffected.
+            # existing scripts/automation are unaffected -- this banner
+            # only ever reaches someone who ran `python main.py` with no
+            # flags and has no idea yet what any of this does.
+            print(
+                "\n[AutoCIM-Agent] --hw-config가 없어 하드웨어 스펙을 대화형으로 고릅니다.\n\n"
+                "  이후 실제 QAT 학습을 포함한 최적화 세션이 시작되며, 반복마다 수 분 이상 걸릴 수 있습니다.\n"
+                "  --target-accuracy / --target-energy-pj / --target-latency-ms "
+                "  입력을 생략했을 때 정확도/에너지/지연시간이 좋지 않아도\n"
+                "  물리적 HW 검증만으로 '수렴' 처리됩니다.\n"
+                "  전체 옵션은 --help.\n"
+                "  예시: python main.py --model-id resnet18 "
+                "--hw-config examples/hw_configs/default_cim_v1_128x128.json "
+                "--target-accuracy 0.7\n"
+            )
             hw_config, allow_approximate_from_prompt = prompt_for_hw_config()
+            # Same interactive-only gate as the hw_config picker above, and
+            # reached regardless of which of its [1]/[2]/[3] branches was
+            # taken -- none of custom/example/default asks about targets on
+            # its own.
+            target_accuracy, target_energy_pj, target_latency_ms = prompt_for_targets(
+                args.target_accuracy, args.target_energy_pj, args.target_latency_ms
+            )
         else:
             hw_config = load_hw_config(args.hw_config)
+            target_accuracy = args.target_accuracy
+            target_energy_pj = args.target_energy_pj
+            target_latency_ms = args.target_latency_ms
     except HWConfigError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         raise SystemExit(1) from None
@@ -1010,9 +1100,9 @@ def main() -> None:
             checkpointer,
             dashboard_out=dashboard_out,
             parallel_warmup_workers=args.parallel_warmup_workers,
-            target_accuracy=args.target_accuracy,
-            target_energy_pj=args.target_energy_pj,
-            target_latency_ms=args.target_latency_ms,
+            target_accuracy=target_accuracy,
+            target_energy_pj=target_energy_pj,
+            target_latency_ms=target_latency_ms,
             allow_approximate_calibration=args.allow_approximate_calibration or allow_approximate_from_prompt,
             auto_hitl=args.auto_hitl,
             auto_hitl_max_rounds=args.auto_hitl_max_rounds,
