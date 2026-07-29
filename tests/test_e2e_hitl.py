@@ -52,6 +52,12 @@ def test_dynamic_interrupt_pauses_at_hitl_and_resumes_with_command(state_factory
     interrupt_obj = result["__interrupt__"][0]
     assert "reason" in interrupt_obj.value
     assert interrupt_obj.value["retry_count"] == MAX_RETRY_LIMIT
+    # main.py's suggest_override_bounds() needs hw_spec_id + targets to
+    # size its suggestion against the actual miss and this hw_spec_id's
+    # real bit ceiling -- must reach the interrupt payload, not just live
+    # in state and never get handed to whoever resumes the session.
+    assert interrupt_obj.value["hw_spec_id"] == registered_bad_hw_config.hw_spec_id
+    assert "target_accuracy" in interrupt_obj.value
 
     # Resume and inspect the very next @planner update -- this is where the
     # sanitization contract (checklist item 3) must fire, right after
