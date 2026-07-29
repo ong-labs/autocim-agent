@@ -287,9 +287,9 @@ def _parse_float_step(label: str, default: Optional[float]) -> Any:
             print("  숫자를 입력해주세요.")
 
 
-# One (field_name, read_fn) pair per HWConfig field prompt_custom_hw_config
-# asks for, in order -- read_fn takes that field's current default/prior
-# answer and returns either the parsed value or `_BACK`.
+# One (field_name, read_fn) pair per HWConfig field the wizard below
+# (run_interactive_setup) asks for, in order -- read_fn takes that field's
+# current default/prior answer and returns either the parsed value or `_BACK`.
 _CUSTOM_HW_CONFIG_STEPS: List[Tuple[str, Callable[[Any], Any]]] = [
     ("hw_spec_id", lambda default: _read_step("hw_spec_id", default)),
     ("crossbar_rows", lambda default: _parse_int_step("crossbar_rows", default)),
@@ -305,32 +305,316 @@ _CUSTOM_HW_CONFIG_STEPS: List[Tuple[str, Callable[[Any], Any]]] = [
 ]
 
 
-def prompt_custom_hw_config() -> Optional[HWConfig]:
-    """Field-by-field HWConfig entry (Enter accepts the shown default; the
-    first pass through defaults to DEFAULT_HW_CONFIG's own values, so a
-    researcher who only cares about e.g. crossbar_rows/cols/adc_bits
-    doesn't have to know every field). Typing 'b'/'back'/'뒤로' at any
-    prompt steps back to the previous field instead of accepting the
-    current one -- no need to restart the whole 11-field sequence over one
-    typo. Typing it at the very *first* field (hw_spec_id) has nowhere
-    earlier to go back to within this form, so it cancels out of custom
-    entry entirely and returns `None` -- the caller (`prompt_for_hw_config`)
-    treats that as "show the [1]/[2]/[3] menu again", which is what a
-    researcher backing out of the first field of a wizard actually expects
-    (re-seeing the same first-field prompt would look like 'back' did
-    nothing at all).
+class _WizardStep:
+    """One step in the unified hw-config/target/dashboard wizard below.
+    `prompt_fn(current_value, answers) -> new_value | _BACK` reads this
+    step's value, using whatever's already stored for it (`current_value`)
+    as the shown default -- re-visiting a step (via 'b' or a confirm-screen
+    jump) never discards it, only Enter-through re-confirms it.
+    `applicable(answers)` decides whether this step is even part of the
+    chain given earlier answers (e.g. the 11 custom HWConfig fields only
+    apply when hw_mode == "1"), recomputed on every visit so an earlier
+    edit (e.g. switching hw_mode, or a crossbar edit that now exactly
+    matches a calibration reference) can add/remove later steps."""
 
-    Individual field prompts only catch type errors (e.g. a non-numeric
-    adc_bits); HWConfig's own range/enum rules (adc_bits<=16, a
-    noc_topology string it doesn't recognize, etc.) are only checked once
-    every field is in. On that failure, the offending field name(s) --
-    read straight from pydantic's own `ValidationError.errors()` -- are
-    printed and the whole step sequence restarts with every just-entered
-    value (including the invalid one, so it's visible to fix) as the new
-    default: re-confirming already-good fields is then a quick Enter-through,
-    not retyping everything from scratch.
+    __slots__ = ("key", "label", "prompt_fn", "applicable")
+
+    def __init__(
+        self,
+        key: str,
+        label: str,
+        prompt_fn: Callable[[Any, Dict[str, Any]], Any],
+        applicable: Callable[[Dict[str, Any]], bool] = lambda answers: True,
+    ):
+        self.key = key
+        self.label = label
+        self.prompt_fn = prompt_fn
+        self.applicable = applicable
+
+
+def _prompt_hw_mode(current: Any, answers: Dict[str, Any]) -> Any:
+    print("\n--hw-config가 지정되지 않았습니다. 어떻게 진행할까요?\n")
+    print("  [1] 직접 값 입력 (Custom HWConfig)")
+    print("  [2] 저장된 예시 파일 사용")
+    print("  [3] 기본값 사용")
+    print("  [4] 종료")
+    raw_choice = input("\n 선택: ").strip()
+    choice = raw_choice or "4"
+    # This is the very first step of the whole chain -- there's nothing
+    # earlier to step 'b' back into, so treat it the same as choice 4
+    # (matches this project's existing "nowhere to go back to -> exit
+    # rather than silently re-showing the same prompt" convention).
+    if choice == "4" or choice.lower() in _BACK_COMMANDS:
+        print("\n입력이 없습니다.\n실행을 종료합니다." if not raw_choice else "\n종료합니다.")
+        raise SystemExit(0)
+    if choice not in {"1", "2", "3"}:
+        choice = "3"
+    return choice
+
+
+_CUSTOM_HW_CONFIG_FIELD_NAMES = [name for name, _ in _CUSTOM_HW_CONFIG_STEPS]
+
+
+def _make_custom_field_prompt(name: str, read_fn: Callable[[Any], Any], initial_defaults: Dict[str, Any]):
+    def _prompt(current: Any, answers: Dict[str, Any]) -> Any:
+        default = current if current is not None else initial_defaults[name]
+        return read_fn(default)
+
+    return _prompt
+
+
+def _try_build_custom_hw_config(
+    answers: Dict[str, Any], initial_defaults: Dict[str, Any]
+) -> Tuple[Optional[HWConfig], List[str]]:
+    """Validates the 11 custom fields once all are answered (called right
+    after the last one). On failure, resets only the offending field(s) in
+    `answers` to their *original* default (never the just-typed invalid
+    value) and returns their names so the caller can jump back to the
+    first custom field -- re-confirming already-good fields is then a
+    quick Enter-through, not retyping everything from scratch."""
+    values = {name: answers[name] for name in _CUSTOM_HW_CONFIG_FIELD_NAMES}
+    try:
+        return HWConfig(**values), []
+    except ValidationError as exc:
+        bad_fields = sorted({str(error["loc"][0]) for error in exc.errors() if error.get("loc")})
+        print(
+            f"입력값이 HWConfig 스키마에 맞지 않습니다 ({', '.join(bad_fields) or '알 수 없는 필드'}):\n{exc}\n"
+            "해당 필드는 원래 기본값으로 되돌리고 나머지는 방금 입력한 값을 유지합니다 -- 다시 확인해주세요."
+        )
+        for field in bad_fields:
+            if field in answers:
+                answers[field] = initial_defaults[field]
+        return None, bad_fields
+
+
+def _prompt_example_choice(current: Any, answers: Dict[str, Any]) -> Any:
+    files = sorted(EXAMPLE_HW_CONFIGS_DIR.glob("*.json"))
+    print("\n=== 저장된 예시 --hw-config 파일 ===")
+    for i, f in enumerate(files, 1):
+        print(f"  [{i}] {f.name}")
+    label = f"번호 선택 [{current}] (뒤로: b): " if current is not None else "번호 선택 (뒤로: b): "
+    while True:
+        raw = input(label).strip()
+        if raw.lower() in _BACK_COMMANDS:
+            return _BACK
+        if not raw and current is not None:
+            return current
+        try:
+            index = int(raw)
+            if not (1 <= index <= len(files)):
+                raise ValueError
+            return index
+        except ValueError:
+            print("  잘못된 선택입니다.")
+
+
+def _assemble_hw_config(answers: Dict[str, Any]) -> Optional[HWConfig]:
+    """Builds the HWConfig the current answers imply, or None if not enough
+    is known yet (hw_mode not chosen, an example file not picked yet, or
+    the custom fields not all in) -- used for the confirm screen's display
+    and to decide whether the approximate-calibration step applies."""
+    mode = answers.get("hw_mode")
+    if mode == "1":
+        if any(answers.get(name) is None for name in _CUSTOM_HW_CONFIG_FIELD_NAMES):
+            return None
+        try:
+            return HWConfig(**{name: answers[name] for name in _CUSTOM_HW_CONFIG_FIELD_NAMES})
+        except ValidationError:
+            return None
+    if mode == "2":
+        choice = answers.get("example_choice")
+        if choice is None:
+            return None
+        files = sorted(EXAMPLE_HW_CONFIGS_DIR.glob("*.json"))
+        try:
+            return load_hw_config(str(files[choice - 1]))
+        except (HWConfigError, IndexError):
+            return None
+    if mode == "3":
+        return DEFAULT_HW_CONFIG
+    return None
+
+
+def _needs_approx_calibration_choice(answers: Dict[str, Any]) -> bool:
+    hw = _assemble_hw_config(answers)
+    if hw is None:
+        return False
+    return not bootstrap_calibration_factors(hw)
+
+
+def _prompt_approx_calibration(current: Any, answers: Dict[str, Any]) -> Any:
+    hw = _assemble_hw_config(answers)
+    nearest = find_nearest_reference(hw) if hw is not None else None
+    if nearest is None:
+        print("[calibration] uncalibrated (no known reference)")
+        return "n"
+    reference, distance = nearest
+    print(
+        f"[calibration] 정확히 일치하는 레퍼런스가 없습니다. 가장 가까운 레퍼런스: "
+        f"{reference.crossbar_rows}x{reference.crossbar_cols}/{reference.adc_bits}-bit ADC "
+        f"(distance={distance:.2f})"
+    )
+    default = current if current in ("y", "n") else "n"
+    raw = input(f"  이 레퍼런스로 근사 보정해서 진행할까요? [{default}] (뒤로: b): ").strip().lower()
+    if raw in _BACK_COMMANDS:
+        return _BACK
+    if not raw:
+        return default
+    return "y" if raw == "y" else "n"
+
+
+def _prompt_target(label: str) -> Callable[[Any, Dict[str, Any]], Any]:
+    def _prompt(current: Any, answers: Dict[str, Any]) -> Any:
+        shown = current if current is not None else "빈칸"
+        while True:
+            raw = input(f"{label} [{shown}] (뒤로: b): ").strip()
+            if raw.lower() in _BACK_COMMANDS:
+                return _BACK
+            if not raw:
+                return current
+            if raw in ("-", "빈칸"):
+                return None
+            try:
+                return float(raw)
+            except ValueError:
+                print("  숫자, '-'(미설정), 또는 빈칸(현재 값 유지)으로 입력해주세요.")
+
+    return _prompt
+
+
+def _prompt_dashboard_yn(current: Any, answers: Dict[str, Any]) -> Any:
+    default = current if current in ("y", "n") else "n"
+    raw = input(f"\n리포트(HTML 대시보드)를 생성할까요? [{default}] (뒤로: b): ").strip().lower()
+    if raw in _BACK_COMMANDS:
+        return _BACK
+    if not raw:
+        return default
+    return "y" if raw == "y" else "n"
+
+
+def _wants_dashboard(answers: Dict[str, Any]) -> bool:
+    return answers.get("dashboard_yn") == "y"
+
+
+def _prompt_dashboard_path(thread_id: str) -> Callable[[Any, Dict[str, Any]], Any]:
+    def _prompt(current: Any, answers: Dict[str, Any]) -> Any:
+        REPORT_DIR.mkdir(parents=True, exist_ok=True)
+        hw = _assemble_hw_config(answers)
+        hw_spec_id = hw.hw_spec_id if hw is not None else "unknown"
+        default = current or str(REPORT_DIR / f"report_{hw_spec_id}_{thread_id[:8]}_{datetime.now():%Y%m%d_%H%M%S}.html")
+        raw = input(f"저장 경로 [{default}] (뒤로: b): ").strip()
+        if raw.lower() in _BACK_COMMANDS:
+            return _BACK
+        return raw or default
+
+    return _prompt
+
+
+def _build_wizard_steps(
+    args: argparse.Namespace, thread_id: str, initial_custom_defaults: Dict[str, Any]
+) -> List[_WizardStep]:
+    is_custom = lambda answers: answers.get("hw_mode") == "1"
+    is_example = lambda answers: answers.get("hw_mode") == "2"
+
+    steps = [_WizardStep("hw_mode", "hw-config 선택 방식", _prompt_hw_mode)]
+    for name, read_fn in _CUSTOM_HW_CONFIG_STEPS:
+        steps.append(_WizardStep(name, name, _make_custom_field_prompt(name, read_fn, initial_custom_defaults), is_custom))
+    steps.append(_WizardStep("example_choice", "선택한 예시 파일", _prompt_example_choice, is_example))
+    steps.append(
+        _WizardStep("approx_calibration_yn", "근사 보정 적용", _prompt_approx_calibration, _needs_approx_calibration_choice)
+    )
+    if args.target_accuracy is None:
+        steps.append(_WizardStep("target_accuracy", "target accuracy", _prompt_target("target accuracy (예: 0.7)")))
+    if args.target_energy_pj is None:
+        steps.append(_WizardStep("target_energy_pj", "target energy_pj", _prompt_target("target energy_pj (예: 2000)")))
+    if args.target_latency_ms is None:
+        steps.append(_WizardStep("target_latency_ms", "target latency_ms", _prompt_target("target latency_ms (예: 5.0)")))
+    if args.dashboard_out is None:
+        steps.append(_WizardStep("dashboard_yn", "리포트 생성", _prompt_dashboard_yn))
+        steps.append(_WizardStep("dashboard_path", "리포트 저장 경로", _prompt_dashboard_path(thread_id), _wants_dashboard))
+    return steps
+
+
+def _index_of(steps: List[_WizardStep], key: str) -> int:
+    return next(i for i, s in enumerate(steps) if s.key == key)
+
+
+def _next_applicable(steps: List[_WizardStep], answers: Dict[str, Any], index: int) -> int:
+    while 0 <= index < len(steps) and not steps[index].applicable(answers):
+        index += 1
+    return index
+
+
+def _prev_applicable(steps: List[_WizardStep], answers: Dict[str, Any], index: int) -> int:
+    while index >= 0 and not steps[index].applicable(answers):
+        index -= 1
+    return index
+
+
+_WIZARD_FIELD_LABELS = {"hw_mode": "hw-config 선택 방식"}
+
+
+def _format_wizard_answer(key: str, value: Any) -> str:
+    if key == "hw_mode":
+        return {"1": "직접 입력", "2": "예시 파일", "3": "기본값"}.get(value, str(value))
+    if key == "example_choice":
+        files = sorted(EXAMPLE_HW_CONFIGS_DIR.glob("*.json"))
+        try:
+            return files[value - 1].name
+        except (IndexError, TypeError):
+            return str(value)
+    if key in ("approx_calibration_yn", "dashboard_yn"):
+        return "예" if value == "y" else "아니오"
+    if value is None:
+        return "(미설정)"
+    return str(value)
+
+
+def _show_confirm_screen(steps: List[_WizardStep], answers: Dict[str, Any]) -> Any:
+    """Prints every applicable, already-answered step and asks whether to
+    proceed. Returns "proceed", "back" (one step, into the last applicable
+    step), or an int index into `steps` -- typing a listed item's number
+    jumps straight there for a quick single-field edit (vs. walking back
+    one step at a time), then the normal forward walk resumes and lands
+    back here once everything after it has been re-confirmed."""
+    applicable_steps = [(i, s) for i, s in enumerate(steps) if s.applicable(answers)]
+    print("\n=== 입력값 확인 ===")
+    for display_no, (_, step) in enumerate(applicable_steps, 1):
+        label = _WIZARD_FIELD_LABELS.get(step.key, step.label)
+        print(f"  [{display_no}] {label}: {_format_wizard_answer(step.key, answers.get(step.key))}")
+    while True:
+        raw = input("\n이대로 진행할까요? [Y]es / n 또는 b = 이전 단계로 / 번호 입력 시 해당 항목 수정: ").strip().lower()
+        if not raw or raw == "y":
+            return "proceed"
+        if raw == "n" or raw in _BACK_COMMANDS:
+            return "back"
+        try:
+            display_no = int(raw)
+            if not (1 <= display_no <= len(applicable_steps)):
+                raise ValueError
+            return applicable_steps[display_no - 1][0]
+        except ValueError:
+            print("  잘못된 입력입니다.")
+
+
+def run_interactive_setup(
+    args: argparse.Namespace, thread_id: str
+) -> Optional[Tuple[HWConfig, bool, Optional[float], Optional[float], Optional[float], Optional[str]]]:
+    """Unified hw-config + target + dashboard wizard for main()'s
+    `args.hw_config is None and sys.stdin.isatty()` branch -- one shared
+    step chain and answers dict spans hw-config selection (custom fields,
+    example-file pick, or the built-in default), the approximate-
+    calibration choice, target_accuracy/energy_pj/latency_ms, and the
+    dashboard Y/N + path, ending in a confirm screen. 'b' at any prompt
+    (or 'n'/'b' at the confirm screen, or typing a listed item's number
+    there) can reach any earlier step without losing anything already
+    entered -- revisiting a step always shows its current answer as the
+    default, so walking back and forward again is a quick Enter-through,
+    not retyping. EOFError/KeyboardInterrupt proceeds with whatever's been
+    entered so far (same non-destructive-fallback spirit as this project's
+    other interactive prompts) rather than discarding it.
     """
-    original_defaults: Dict[str, Any] = {
+    initial_custom_defaults: Dict[str, Any] = {
         "hw_spec_id": f"custom_{uuid.uuid4().hex[:8]}",
         "crossbar_rows": DEFAULT_HW_CONFIG.crossbar_rows,
         "crossbar_cols": DEFAULT_HW_CONFIG.crossbar_cols,
@@ -343,181 +627,57 @@ def prompt_custom_hw_config() -> Optional[HWConfig]:
         "device_noise_sigma": DEFAULT_HW_CONFIG.device_noise_sigma,
         "sram_buffer_kb": DEFAULT_HW_CONFIG.sram_buffer_kb,
     }
-    values: Dict[str, Any] = dict(original_defaults)
+    steps = _build_wizard_steps(args, thread_id, initial_custom_defaults)
+    first_custom_key = _CUSTOM_HW_CONFIG_FIELD_NAMES[0]
+    last_custom_key = _CUSTOM_HW_CONFIG_FIELD_NAMES[-1]
 
-    while True:
-        print("\n=== 커스텀 HWConfig 입력 (Enter로 기본값 유지, 'b'로 이전 필드) ===")
-        index = 0
-        while index < len(_CUSTOM_HW_CONFIG_STEPS):
-            name, read_fn = _CUSTOM_HW_CONFIG_STEPS[index]
-            result = read_fn(values[name])
-            if result is _BACK:
-                if index == 0:
-                    print("\n최상위 필드로 돌아갑니다.")
-                    return None
-                index -= 1
+    answers: Dict[str, Any] = {}
+    index = 0
+    try:
+        while True:
+            index = _next_applicable(steps, answers, index)
+            if index >= len(steps):
+                action = _show_confirm_screen(steps, answers)
+                if action == "proceed":
+                    break
+                if action == "back":
+                    index = _prev_applicable(steps, answers, len(steps) - 1)
+                    continue
+                index = action  # jump straight to a specific field
                 continue
-            values[name] = result
+            if index < 0:
+                # Backed out past the very first step -- _prompt_hw_mode
+                # itself exits before this can happen today, but this stays
+                # as a safety net rather than silently looping forever.
+                return None
+
+            step = steps[index]
+            value = step.prompt_fn(answers.get(step.key), answers)
+            if value is _BACK:
+                index = _prev_applicable(steps, answers, index - 1)
+                continue
+            answers[step.key] = value
+
+            if step.key == last_custom_key:
+                _, bad_fields = _try_build_custom_hw_config(answers, initial_custom_defaults)
+                if bad_fields:
+                    index = _index_of(steps, first_custom_key)
+                    continue
+
             index += 1
-
-        try:
-            return HWConfig(**values)
-        except ValidationError as exc:
-            bad_fields = sorted({str(error["loc"][0]) for error in exc.errors() if error.get("loc")})
-            print(
-                f"입력값이 HWConfig 스키마에 맞지 않습니다 ({', '.join(bad_fields) or '알 수 없는 필드'}):\n{exc}\n"
-                "해당 필드는 원래 기본값으로 되돌리고 나머지는 방금 입력한 값을 유지합니다 -- 다시 확인해주세요."
-            )
-            # Reset only the offending field(s) to their *original* default
-            # (never the just-typed invalid value) -- otherwise hitting
-            # Enter on a bad field re-submits the same invalid value and
-            # loops forever. Every other field keeps what was already
-            # entered, so re-confirming them is a quick Enter-through.
-            for field in bad_fields:
-                if field in values:
-                    values[field] = original_defaults[field]
-
-
-def prompt_hw_config_from_examples() -> Optional[HWConfig]:
-    """Lets a researcher pick one of the checked-in examples/hw_configs/
-    files by number instead of typing its path -- `None` (caller falls back
-    to DEFAULT_HW_CONFIG) if the directory is empty or the researcher
-    cancels (blank input) or mistypes the number."""
-    files = sorted(EXAMPLE_HW_CONFIGS_DIR.glob("*.json"))
-    if not files:
-        return None
-    print("\n=== 저장된 예시 --hw-config 파일 ===")
-    for i, f in enumerate(files, 1):
-        print(f"  [{i}] {f.name}")
-    raw = input("번호 선택 (Enter로 취소): ").strip()
-    if not raw:
-        return None
-    try:
-        index = int(raw)
-        if not (1 <= index <= len(files)):
-            raise ValueError
-    except ValueError:
-        print("잘못된 선택입니다 -- 기본값을 사용합니다.")
-        return None
-    return load_hw_config(str(files[index - 1]))
-
-
-def prompt_for_hw_config() -> Tuple[HWConfig, bool]:
-    """Interactive --hw-config picker -- main() calls this only when
-    --hw-config was omitted and stdin is a real terminal, so a scripted/CI
-    invocation (or one that already passes --hw-config) never sees it and
-    behaves exactly as before this existed.
-
-    Offers: type a custom HWConfig directly (prompt_custom_hw_config), pick
-    a saved examples/hw_configs/ file (prompt_hw_config_from_examples), or
-    the built-in default. Immediately reports whether the resulting
-    hw_config has an exact tools/calibration.py match and, if not, offers
-    approximate calibration for just this run (the returned bool) --
-    without requiring the researcher to already know
-    --allow-approximate-calibration exists. EOFError/KeyboardInterrupt at
-    any point falls back to (DEFAULT_HW_CONFIG, False) rather than crashing
-    -- same "soft, non-destructive fallback" spirit as prompt_for_override's
-    HITL handling.
-    """
-    try:
-        hw_config: Optional[HWConfig] = None
-        while hw_config is None:
-            print("--hw-config가 지정되지 않았습니다. 어떻게 진행할까요?\n")
-            print("  [1] 직접 값 입력 (Custom HWConfig)")
-            print("  [2] 저장된 예시 파일 사용")
-            print("  [3] 기본값 사용")
-            print("  [4] 종료")
-            raw_choice = input("\n 선택: ").strip()
-            choice = raw_choice or "4"
-
-            if choice == "1":
-                hw_config = prompt_custom_hw_config()  # None if cancelled via 'back' on the first field -> loop, re-show menu
-            elif choice == "2":
-                hw_config = prompt_hw_config_from_examples() or DEFAULT_HW_CONFIG
-            elif choice == "3":
-                hw_config = DEFAULT_HW_CONFIG
-            elif choice == "4":
-                print("\n입력이 없습니다.\n실행을 종료합니다." if not raw_choice else "\n종료합니다.")
-                raise SystemExit(0)
-            else:
-                hw_config = DEFAULT_HW_CONFIG
     except (EOFError, KeyboardInterrupt):
-        print("\n입력을 받지 못해 기본값을 사용합니다.")
-        return DEFAULT_HW_CONFIG, False
+        print("\n입력을 받지 못했습니다. 지금까지 입력한 값으로 진행합니다.")
 
-    if bootstrap_calibration_factors(hw_config):
-        print("[calibration] exact match")
-        return hw_config, False
-
-    nearest = find_nearest_reference(hw_config)
-    if nearest is None:
-        print("[calibration] uncalibrated (no known reference)")
-        return hw_config, False
-
-    reference, distance = nearest
-    print(
-        f"[calibration] 정확히 일치하는 레퍼런스가 없습니다. 가장 가까운 레퍼런스: "
-        f"{reference.crossbar_rows}x{reference.crossbar_cols}/{reference.adc_bits}-bit ADC "
-        f"(distance={distance:.2f})"
-    )
-    try:
-        answer = input("  이 레퍼런스로 근사 보정해서 진행할까요? [Y/N]: ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        answer = ""
-    return hw_config, answer == "y"
-
-
-def _read_optional_float(label: str) -> Optional[float]:
-    """One target-metric prompt: blank -> None (ungated), a number -> that
-    target. Loops on unparseable non-blank input instead of silently
-    discarding a typo as "ungated"."""
-    while True:
-        raw = input(f"{label} (빈칸=미설정): ").strip()
-        if not raw:
-            return None
-        try:
-            return float(raw)
-        except ValueError:
-            print("  숫자를 입력하거나 빈칸으로 두세요.")
-
-
-def prompt_for_targets(
-    target_accuracy: Optional[float],
-    target_energy_pj: Optional[float],
-    target_latency_ms: Optional[float],
-) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-    """Interactive target-accuracy/energy/latency picker -- main() calls this
-    right after prompt_for_hw_config() (any of its [1]/[2]/[3] branches), so
-    it's not skippable by picking one hw_spec source over another: all three
-    leave every target ungated by default, and nodes/evaluator.py's
-    is_converged only checks a configured target -- with none configured, a
-    candidate that merely clears @verifier's physical IR-drop/noise check
-    (accuracy/energy/latency notwithstanding) still gets reported
-    "Converged". Only prompts for whichever of the three wasn't already
-    passed on the command line; a value already given via
-    --target-accuracy/--target-energy-pj/--target-latency-ms is never
-    overridden here. EOFError/KeyboardInterrupt leaves whatever hasn't been
-    answered yet as ungated (None), same non-destructive-fallback spirit as
-    prompt_for_hw_config/prompt_for_override -- it does not discard targets
-    already entered before the interrupt."""
-    if target_accuracy is not None and target_energy_pj is not None and target_latency_ms is not None:
-        return target_accuracy, target_energy_pj, target_latency_ms
-
-    print(
-        "\n--target-accuracy/--target-energy-pj/--target-latency-ms가 지정되지 않았습니다.\n"
-        "값을 입력하면 그 기준을 만족해야 '수렴'으로 인정되고, 빈칸으로 두면 물리적 HW 검증\n"
-        "(IR-drop/노이즈)만으로 수렴 판정됩니다."
-    )
-    try:
-        if target_accuracy is None:
-            target_accuracy = _read_optional_float("target accuracy (예: 0.7)")
-        if target_energy_pj is None:
-            target_energy_pj = _read_optional_float("target energy_pj (예: 2000)")
-        if target_latency_ms is None:
-            target_latency_ms = _read_optional_float("target latency_ms (예: 5.0)")
-    except (EOFError, KeyboardInterrupt):
-        print("\n입력을 받지 못해 나머지 target은 미설정(빈칸)으로 둡니다.")
-    return target_accuracy, target_energy_pj, target_latency_ms
+    hw_config = _assemble_hw_config(answers) or DEFAULT_HW_CONFIG
+    allow_approximate = answers.get("approx_calibration_yn") == "y"
+    target_accuracy = answers.get("target_accuracy", args.target_accuracy)
+    target_energy_pj = answers.get("target_energy_pj", args.target_energy_pj)
+    target_latency_ms = answers.get("target_latency_ms", args.target_latency_ms)
+    if args.dashboard_out is not None:
+        dashboard_out = args.dashboard_out  # dashboard_yn/path steps weren't in the chain at all
+    else:
+        dashboard_out = answers.get("dashboard_path") if answers.get("dashboard_yn") == "y" else None
+    return hw_config, allow_approximate, target_accuracy, target_energy_pj, target_latency_ms, dashboard_out
 
 
 def build_initial_state(
@@ -690,14 +850,14 @@ def auto_resolve_override(interrupt_payload: Dict[str, Any]) -> Optional[Dict[st
 
 
 def prompt_for_dashboard_out(hw_spec_id: str, thread_id: str) -> Optional[str]:
-    """Interactive --dashboard-out picker -- main() calls this only when
-    --dashboard-out was omitted and stdin is a real terminal, same gating as
-    prompt_for_hw_config so a scripted/CI invocation never sees it. Default
-    filename is derived from hw_spec_id + thread_id (already unique per
-    fresh session) so back-to-back interactive runs never clobber each
-    other's report, and lands under REPORT_DIR instead of the repo root.
-    EOFError/KeyboardInterrupt falls back to None (no report), matching
-    prompt_for_hw_config's non-destructive fallback.
+    """Interactive --dashboard-out picker for the case run_interactive_setup()
+    doesn't cover: --hw-config was given explicitly (so there's no hw-config/
+    target wizard to fold this into) but --dashboard-out was omitted and
+    stdin is a real terminal. Default filename is derived from hw_spec_id +
+    thread_id (already unique per fresh session) so back-to-back interactive
+    runs never clobber each other's report, and lands under REPORT_DIR
+    instead of the repo root. EOFError/KeyboardInterrupt falls back to None
+    (no report) rather than crashing.
     """
     try:
         answer = input("\n리포트(HTML 대시보드)를 생성할까요? [Y/N]: ").strip().lower()
@@ -1049,11 +1209,12 @@ def main() -> None:
             print_sessions(list_sessions(checkpointer))
         return
 
+    thread_id = args.thread_id or str(uuid.uuid4())
     allow_approximate_from_prompt = False
     try:
         if args.hw_config is None and sys.stdin.isatty():
             # No --hw-config given and a human is actually at the terminal
-            # (not a script/CI pipe) -- offer the interactive picker instead
+            # (not a script/CI pipe) -- offer the interactive wizard instead
             # of silently falling back to DEFAULT_HW_CONFIG. Passing
             # --hw-config explicitly (any value) always skips this, so
             # existing scripts/automation are unaffected -- this banner
@@ -1070,27 +1231,23 @@ def main() -> None:
                 "--hw-config examples/hw_configs/default_cim_v1_128x128.json "
                 "--target-accuracy 0.7\n"
             )
-            hw_config, allow_approximate_from_prompt = prompt_for_hw_config()
-            # Same interactive-only gate as the hw_config picker above, and
-            # reached regardless of which of its [1]/[2]/[3] branches was
-            # taken -- none of custom/example/default asks about targets on
-            # its own.
-            target_accuracy, target_energy_pj, target_latency_ms = prompt_for_targets(
-                args.target_accuracy, args.target_energy_pj, args.target_latency_ms
+            setup = run_interactive_setup(args, thread_id)
+            if setup is None:
+                raise SystemExit(0)
+            hw_config, allow_approximate_from_prompt, target_accuracy, target_energy_pj, target_latency_ms, dashboard_out = (
+                setup
             )
         else:
             hw_config = load_hw_config(args.hw_config)
             target_accuracy = args.target_accuracy
             target_energy_pj = args.target_energy_pj
             target_latency_ms = args.target_latency_ms
+            dashboard_out = args.dashboard_out
+            if dashboard_out is None and sys.stdin.isatty():
+                dashboard_out = prompt_for_dashboard_out(hw_config.hw_spec_id, thread_id)
     except HWConfigError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         raise SystemExit(1) from None
-    thread_id = args.thread_id or str(uuid.uuid4())
-
-    dashboard_out = args.dashboard_out
-    if dashboard_out is None and sys.stdin.isatty():
-        dashboard_out = prompt_for_dashboard_out(hw_config.hw_spec_id, thread_id)
 
     with SqliteSaver.from_conn_string(checkpoint_db) as checkpointer:
         run_session(
