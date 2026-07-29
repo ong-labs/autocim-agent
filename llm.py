@@ -61,9 +61,46 @@ _MODEL_ENV_VAR = "AUTOCIM_PLANNER_MODEL"
 # override with a cloud provider spec instead.
 _DEFAULT_LOCAL_MODEL = "ollama:qwen2.5:7b"
 
+# init_chat_model()'s provider prefix -> the API key env var that provider
+# needs. Deliberately only the providers this project's README already
+# documents as verified (its --model-id/forced-tool-calling table) --
+# providers/local backends (ollama, etc.) not in this map never trigger the
+# fallback below, matching how they need no key today.
+_PROVIDER_API_KEY_ENV = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "groq": "GROQ_API_KEY",
+    "google_genai": "GOOGLE_API_KEY",
+}
+
+
+def resolve_planner_model() -> Tuple[str, Optional[str]]:
+    """The `<provider>:<model>` string `get_planner_chat_model()` will
+    actually use, plus a one-line reason string when it differs from a
+    plain `AUTOCIM_PLANNER_MODEL` passthrough (None otherwise) -- split out
+    from `get_planner_chat_model()` so main.py can print this at session
+    start without constructing a real chat model just to know what it'll
+    be. AUTOCIM_PLANNER_MODEL set to a cloud provider this project knows
+    the API key env var for, but that env var is empty/unset, falls back
+    to the local default instead of letting init_chat_model() fail deep
+    inside a run -- most likely cause is `.env.example` copied into
+    `.env.local` with the provider filled in but the key left blank."""
+    model = os.environ.get(_MODEL_ENV_VAR)
+    if not model:
+        return _DEFAULT_LOCAL_MODEL, None
+    provider = model.split(":", 1)[0]
+    required_key_env = _PROVIDER_API_KEY_ENV.get(provider)
+    if required_key_env and not os.environ.get(required_key_env):
+        return (
+            _DEFAULT_LOCAL_MODEL,
+            f"{_MODEL_ENV_VAR}={model!r} needs {required_key_env}, which isn't set -- "
+            f"falling back to the local default.",
+        )
+    return model, None
+
 
 def get_planner_chat_model() -> BaseChatModel:
-    model = os.environ.get(_MODEL_ENV_VAR) or _DEFAULT_LOCAL_MODEL
+    model, _reason = resolve_planner_model()
     return init_chat_model(model, temperature=0)
 
 
