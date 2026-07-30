@@ -249,7 +249,7 @@ def test_fourth_and_fifth_references_are_distinguished_by_adc_bits_alone():
     assert find_matching_reference(_hw()) is _REFERENCE
 
 
-# --- Sixth reference (Dong, Sinangil et al. 2020, 64x64/4-bit-ADC/4-bit-weight) --
+# --- Sixth reference (Garg, Jia, Phadke & Yu 2026 FeFET, 64x64/4-bit-ADC) --
 
 _REFERENCE_6 = KNOWN_REFERENCES[5]
 
