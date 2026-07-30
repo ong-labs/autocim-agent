@@ -35,7 +35,16 @@ from schemas.tools import LayerBitConfig
 
 @dataclass(frozen=True)
 class CIMTechParams:
-    """Reference (uncalibrated) technology constants."""
+    """Reference (uncalibrated) technology constants.
+
+    Order-of-magnitude placeholders, not values fit or validated against any
+    specific real chip -- there is no sensitivity analysis here showing
+    downstream Pareto rankings are robust to a different-but-plausible set
+    of these numbers. `calibration_factors`/`calibration_provenance`
+    (tools/calibration.py) is this project's actual honesty mechanism for
+    that gap: any `hw_spec_id` without a real published-reference match
+    stays visibly "uncalibrated" (tools/dashboard.py) rather than silently
+    trusting these constants' absolute scale."""
 
     adc_ref_energy_fj: float = 0.2  # energy of a 1-bit-equivalent flash-ADC conversion step
     dac_ref_energy_fj: float = 0.05  # energy per DAC bit driven
