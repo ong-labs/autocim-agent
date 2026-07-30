@@ -154,29 +154,62 @@ def group_quantizable_layers(model: nn.Module) -> Dict[str, List[str]]:
 
 
 class _FakeQuantSTE(torch.autograd.Function):
-    """Symmetric per-tensor fake quantization with a straight-through
-    gradient estimator -- standard QAT technique: forward simulates the
-    quantization grid, backward passes the gradient through unchanged so
-    the optimizer can still update the underlying full-precision weight."""
+    """Symmetric, per-output-channel ("per-crossbar-column") fake
+    quantization with a straight-through gradient estimator -- each output
+    channel (dim 0, same "crossbar column" convention `_CrossbarQuantPrune`
+    below already prunes at) gets its own scale, not one scale shared
+    across the whole layer.
+
+    A single per-tensor scale sizes the entire quantization grid off
+    whichever column happens to have the largest weight magnitude,
+    crushing every other column's own dynamic range down to a handful of
+    quantization steps near zero -- real crossbar columns routinely differ
+    by an order of magnitude or more in weight scale. Per-column scaling
+    is standard practice for accurate CIM quantization at a given
+    bit-width -- it's also the more physically accurate model here, not
+    just an accuracy trick: each crossbar column has its own physical
+    read-out path, so an independent scale per column matches the
+    hardware being simulated more closely than one shared scale would.
+
+    Still one bit-width per stage (`LayerBitConfig.weight_bits`, unchanged)
+    -- only the quantization grid's *scale* is now per-column; forward
+    simulates the resulting grid, backward passes the gradient through
+    unchanged so the optimizer can still update the underlying
+    full-precision weight.
+
+    `channel_dim` generalizes which axis is "the column": weight tensors
+    are `[out_channels, in_channels, ...]` (dim 0), but a layer's *output*
+    tensor -- used by `_PartialSumQuant` below to quantize the analog
+    partial sum a real ADC would read out, before it leaves the array --
+    is `[batch, out_channels, ...]` (dim 1). Same math either way, just a
+    different axis moved to the front before the per-channel reduction."""
 
     @staticmethod
-    def forward(ctx, x: torch.Tensor, bits: int) -> torch.Tensor:
+    def forward(ctx, x: torch.Tensor, bits: int, channel_dim: int = 0) -> torch.Tensor:
         qmax = max(2 ** (bits - 1) - 1, 0)
         qmin = -(2 ** (bits - 1))
-        scale = x.detach().abs().max().clamp(min=1e-8) / max(qmax, 1)
+        moved = x.detach().movedim(channel_dim, 0)
+        num_channels = moved.shape[0]
+        per_channel_max = moved.reshape(num_channels, -1).abs().max(dim=1).values
+        scale_shape = [1] * x.dim()
+        scale_shape[channel_dim] = num_channels
+        scale = per_channel_max.clamp(min=1e-8).view(scale_shape) / max(qmax, 1)
         return torch.clamp(torch.round(x / scale), qmin, qmax) * scale
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        return grad_output, None
+        return grad_output, None, None
 
 
 class _CrossbarQuantPrune(nn.Module):
     """`torch.nn.utils.parametrize` transform applied to a layer's `weight`:
-    fake-quantize to `bits`, then zero the `pruning_ratio` fraction of
-    output channels ("crossbar columns", dim 0 in PyTorch's
-    [out_channels, in_channels, ...] weight layout) with the smallest L1
-    magnitude -- a standard structured-pruning ranking criterion.
+    fake-quantize to `bits` (`_FakeQuantSTE`, per-column scale), then zero
+    the `pruning_ratio` fraction of output channels ("crossbar columns",
+    dim 0 in PyTorch's [out_channels, in_channels, ...] weight layout) with
+    the smallest L1 magnitude -- a standard structured-pruning ranking
+    criterion. Quantization happens first, so pruning ranks (and later
+    zeroes) already-quantized columns, matching the order a real crossbar
+    would apply them in.
     """
 
     def __init__(self, bits: int, pruning_ratio: float):
@@ -185,7 +218,7 @@ class _CrossbarQuantPrune(nn.Module):
         self.pruning_ratio = pruning_ratio
 
     def forward(self, weight: torch.Tensor) -> torch.Tensor:
-        w = _FakeQuantSTE.apply(weight, self.bits)
+        w = _FakeQuantSTE.apply(weight, self.bits, 0)
         out_channels = w.shape[0]
         k = int(round(out_channels * self.pruning_ratio))
         if k > 0:
@@ -197,8 +230,46 @@ class _CrossbarQuantPrune(nn.Module):
         return w
 
 
+class _PartialSumQuant:
+    """Forward hook (not a parametrization -- there's no `weight` to
+    attach to; this quantizes the module's *output*) applied to a
+    Conv2d/Linear's output: fake-quantizes it to `adc_bits`, one scale per
+    output channel. A layer's raw output here stands in for the analog
+    partial sum a real crossbar accumulates per column before its ADC
+    reads it out -- the ADC's own limited resolution is what actually
+    bounds how precisely that accumulation is captured, independent of
+    however many bits the weights/inputs were quantized to. Per-column
+    scale for the same reason `_CrossbarQuantPrune` uses one for weights:
+    different output channels can have very different accumulated
+    magnitudes, and one shared scale would waste ADC codes on whichever
+    channel happens to run hottest.
+
+    `adc_bits` is `HWConfig.adc_bits` -- a fixed physical property of the
+    chip (CLAUDE.md 5.C: never hardcoded, always sourced from HWConfig),
+    not a per-stage value `@planner`'s search tunes the way weight_bits is.
+    A single crossbar's ADC serves every column of that array the same
+    way; there's no per-stage knob to turn here in real hardware, so
+    `apply_crossbar_quant_prune` takes it once for the whole model rather
+    than per stage_configs entry.
+
+    dim 1 (not dim 0) is the channel axis here: a module's output is
+    `[batch, out_channels, ...]`, batch first -- `_FakeQuantSTE`'s
+    `channel_dim` parameter exists specifically so this and
+    `_CrossbarQuantPrune` (dim 0, no batch axis on a weight tensor) can
+    share the same underlying math."""
+
+    def __init__(self, adc_bits: int):
+        self.adc_bits = adc_bits
+
+    def __call__(self, module: nn.Module, inputs: Tuple[torch.Tensor, ...], output: torch.Tensor) -> torch.Tensor:
+        return _FakeQuantSTE.apply(output, self.adc_bits, 1)
+
+
 def apply_crossbar_quant_prune(
-    model: nn.Module, stage_configs: Dict[str, StageConfig], default_config: StageConfig
+    model: nn.Module,
+    stage_configs: Dict[str, StageConfig],
+    default_config: StageConfig,
+    adc_bits: Optional[int] = None,
 ) -> None:
     """Mutates `model` in place: registers `_CrossbarQuantPrune` on every
     `Conv2d`/`Linear` submodule's `weight`, using that module's real stage's
@@ -206,11 +277,20 @@ def apply_crossbar_quant_prune(
     `group_quantizable_layers`'s stage names) if present, else
     `default_config`. Callers must pass a model they own (e.g. a fresh
     `copy.deepcopy` of a cached base model), never the shared cached
-    instance -- see `run_qat_tuning`."""
+    instance -- see `run_qat_tuning`.
+
+    `adc_bits`, if given, also registers `_PartialSumQuant` as a forward
+    hook on every one of those same submodules -- column-wise partial-sum
+    quantization (see its docstring), applied identically to every stage
+    since ADC precision is a hardware-wide constant, not something
+    stage_configs varies. `None` (the default) skips it entirely, matching
+    every caller's behavior before this parameter existed."""
     for name, module in model.named_modules():
         if isinstance(module, (nn.Conv2d, nn.Linear)):
             bits, pruning_ratio = stage_configs.get(_stage_of(name), default_config)
             parametrize.register_parametrization(module, "weight", _CrossbarQuantPrune(bits, pruning_ratio))
+            if adc_bits is not None:
+                module.register_forward_hook(_PartialSumQuant(adc_bits))
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +354,7 @@ def run_qat_tuning(
     max_epochs: int,
     early_stopping_patience: Optional[int] = None,
     device: Optional[str] = None,
+    adc_bits: Optional[int] = None,
 ) -> Dict[str, float]:
     """Real QAT trial for one candidate config: deep-copies `backend`'s base
     model (so each candidate starts from the same pretrained weights, never
@@ -281,7 +362,9 @@ def run_qat_tuning(
     `_resolve_device(device)` (`backend.base_model`/loaders themselves stay
     on CPU -- only this per-trial copy moves), applies each real stage's
     own crossbar-aligned fake-quant + structured pruning (falling back to
-    `default_config` for any stage `stage_configs` doesn't cover),
+    `default_config` for any stage `stage_configs` doesn't cover) plus
+    `adc_bits`-precision column-wise partial-sum quantization on every
+    stage alike if `adc_bits` is given (`apply_crossbar_quant_prune`),
     fine-tunes for up to `max_epochs` real gradient-descent epochs against
     `backend.train_loader` (monitoring `backend.val_loader` for early
     stopping), and returns real measured accuracy on `backend.test_loader`
@@ -290,7 +373,7 @@ def run_qat_tuning(
     """
     resolved_device = _resolve_device(device)
     model = copy.deepcopy(backend.base_model).to(resolved_device)
-    apply_crossbar_quant_prune(model, stage_configs, default_config)
+    apply_crossbar_quant_prune(model, stage_configs, default_config, adc_bits)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     criterion = nn.CrossEntropyLoss()
