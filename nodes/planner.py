@@ -2,11 +2,12 @@
 
 Research_Plan.md 2/3 attribute surrogate-model construction (BO/NSGA-II
 normalization, LHS sampling) and history-based search-bound updates to
-@planner. `tools/search.py` implements the real (if minimal-dependency)
-version of that: real n-dimensional Latin Hypercube Sampling for the first
-`warmup_count(n_stages)` iterations, then an IDW-surrogate + random-search
-UCB acquisition once real `candidate_history` (state.py, populated by
-@evaluator) exists -- one independent (weight_bits, column_pruning_ratio)
+@planner. `tools/search.py` implements the real version of that: real
+n-dimensional Latin Hypercube Sampling for the first `warmup_count(n_stages)`
+iterations, then an IDW-surrogate feeding a genuinely multi-objective
+(accuracy/energy_pj/noc_latency_ms) real NSGA-II (`pymoo`) acquisition once
+real `candidate_history` (state.py, populated by @evaluator) exists -- one
+independent (weight_bits, column_pruning_ratio)
 pair *per real model stage* (`tools.qat.get_layer_groups`), not a single
 flat point fanned out via a fixed rule: the search space is genuinely
 `2 * len(stage_names)`-dimensional (12 for resnet18's 6 stages, up to 40 for
@@ -14,20 +15,36 @@ mobilenet_v2's 20). `points_to_stage_configs` only rounds/clamps each
 stage's searched point into a `LayerBitConfig` -- it introduces no bias of
 its own; whatever differences exist between stages come from the search
 itself finding them independently, not from a hardcoded edge-stage rule.
-The LLM sees the real stage names and this per-stage suggestion, and makes
-the final call via a forced tool call (`PlannerLayerDecision`,
-schemas/planner.py) -- never free-form text parsed for numbers, which is
-what Research_Plan.md 1 names as the "수치 환각 (Hallucination)" failure mode
-of using an LLM alone. Hardware bounds (`HWConfig.adc_bits`/`dac_bits`) are
-likewise stated as a constraint for the LLM to respect -- @tuner's own
-tool-call validation is still the actual enforcement point for those
-bounds, the LLM is not trusted for that.
+
+The LLM does NOT set `layer_configs` -- `stage_configs` (the search's own
+output) is what actually reaches @tuner, unconditionally, whether or not
+the LLM call even succeeds. This is a deliberate departure from
+Research_Plan.md 3's original "LLM은 오직 파라미터 판단 및 의사결정
+(tool_calls)만 수행합니다": a real production run (this session) caught a
+local tool-calling model reasoning backwards about an accuracy shortfall
+(reducing weight_bits "to improve accuracy" -- the opposite of what
+actually helps), silently producing a worse candidate than the search's
+own suggestion. The LLM's forced tool call (`PlannerLayerDecision`,
+schemas/planner.py) is narrowed to `rationale`/`rationale_ko` (explaining
+the already-decided candidate, never free-form text parsed for numbers --
+what Research_Plan.md 1 calls "수치 환각 (Hallucination)") and
+`anomaly_note` (an early-warning flag a researcher should see now, not
+just after `MAX_RETRY_LIMIT` routine misses -- see `state.py`'s
+`planner_flagged_anomaly` and `nodes/evaluator.py`). Hardware bounds
+(`HWConfig.adc_bits`/`dac_bits`) still bound `stage_configs` via
+`search_bounds()` below, same as always -- now the *only* enforcement
+point, since there is no longer an LLM-proposed value to separately clamp.
 
 This module also owns the state-sanitization contract every other node
 depends on: when `human_overrides` was just produced by `hitl_node`,
 consume it and reset `needs_hitl`/`retry_count` in the same step so it
 doesn't re-trigger the same HITL interrupt forever (checklist item 3 /
-CLAUDE.md 5.A).
+CLAUDE.md 5.A). Only the transient `human_overrides`/`needs_hitl`/
+`retry_count` signal is reset this way -- the bounds themselves are merged
+into `search_bound_overrides` (state.py) in the same step, and every
+`search_bounds()` call below reads that persisted, merged dict, not
+just-this-iteration's `human_overrides`, so an approved override keeps
+constraining every later candidate for the rest of the run.
 
 Sanitization only fires when there actually is an override to consume.
 `retry_count` must otherwise survive ordinary "Re-plan with History" loops
@@ -49,7 +66,7 @@ from nodes.common import run_id_for
 from observability import log_event
 from schemas.planner import PlannerLayerDecision
 from schemas.tools import LayerBitConfig
-from state import AutoCIMState
+from state import AutoCIMState, merge_dicts
 from tools.qat import get_layer_groups
 from tools.search import Bounds, StagePoint, propose_stage_candidates_via_surrogate, warmup_stage_candidate
 
@@ -99,21 +116,26 @@ def search_seed_for(model_id: str, hw_spec_id: str) -> int:
 _SYSTEM_PROMPT = (
     "You are the @planner agent in AutoCIM-Agent, a CIM-chip HW-SW "
     "co-design optimizer. You are given the target model's real stages, a "
-    "statistically-proposed per-stage (weight_bits, column_pruning_ratio) "
-    "search candidate -- from Latin Hypercube warm-up sampling or a "
-    "surrogate-model acquisition over prior measured candidates -- plus the "
-    "target hardware's bounds and recent failure history. Finalize the next "
-    f"iteration's layer-wise quantization/pruning config by calling `{_TOOL_NAME}` "
-    "-- a tool call only, never plain text. Rules:\n"
-    "1. layer_configs must have exactly one entry per name in "
-    "real_model_stages, using that exact string as layer_name.\n"
-    "2. Every entry, including the 2nd/3rd/etc., must set all four fields: "
-    "layer_name, weight_bits, activation_bits, column_pruning_ratio -- never "
-    "omit a field on any entry after the first.\n"
-    "3. Start from each stage's per_stage_suggested_candidate as-is, or "
-    "adjust a stage within the stated hw bounds only if recent_failure_history "
-    "shows a specific convergence problem it doesn't address (e.g. persistent "
-    "IR-drop/noise failure -> prefer fewer weight_bits or higher pruning)."
+    "per_stage_suggested_candidate -- one (weight_bits, column_pruning_ratio) "
+    "pair per stage, already finalized by a statistical search (Latin "
+    "Hypercube warm-up sampling or a multi-objective NSGA-II acquisition "
+    "over prior measured candidates) -- plus the target hardware's bounds "
+    "and recent failure history. You do NOT choose or adjust weight_bits/ "
+    f"column_pruning_ratio yourself. Call `{_TOOL_NAME}` -- a tool call "
+    "only, never plain text -- with exactly these fields:\n"
+    "1. rationale: briefly explain why per_stage_suggested_candidate is a "
+    "reasonable next step, referencing the stated hw bounds and "
+    "recent_failure_history. Do not propose different numbers -- describe "
+    "the candidate you were given.\n"
+    "2. rationale_ko: a Korean translation of the same rationale -- same "
+    "content, not a summary or a different justification.\n"
+    "3. anomaly_note: leave this null unless recent_failure_history or "
+    "per_stage_suggested_candidate shows something genuinely concerning "
+    "enough that a researcher should look at it right now, not just after "
+    "the usual retry budget runs out -- e.g. the exact same candidate "
+    "failing repeatedly with no change, or a metric that looks physically "
+    "implausible. Do not set it for routine, expected-looking failures; "
+    "that is what the normal retry loop already handles."
 )
 
 
@@ -206,58 +228,6 @@ def points_to_stage_configs(stage_points: StagePoint, stage_names: List[str]) ->
     return configs
 
 
-def _clamp_layer_configs(
-    layer_configs: List[LayerBitConfig], overrides: Optional[Dict[str, Any]]
-) -> List[LayerBitConfig]:
-    """Hard-clamps the LLM's (or fallback's) final weight_bits/
-    column_pruning_ratio into `human_overrides` (HITL `new_bounds`) after
-    the fact -- mirrors this module's existing "the LLM is not trusted for
-    [bound] enforcement" policy (module docstring re: HWConfig.adc_bits/
-    dac_bits) applied specifically to human_overrides, since a forced
-    tool-calling response honoring the `researcher_overrides` prompt text
-    was never guaranteed (weaker local/cloud models especially -- see
-    README's provider table).
-
-    Deliberately narrower than `search_bounds()`'s (hw ceiling + override)
-    pair: this only enforces the override values themselves (a no-op when
-    `overrides` is empty, as on every non-HITL iteration), never the
-    hw-derived ceiling on its own -- that stays exclusively @tuner's tool-
-    call validation's job, same as before this function existed (a
-    conflicting/inverted override pair, e.g. min > max, is ignored for that
-    one dimension rather than forced to a nonsensical single value).
-    activation_bits is left untouched: overrides only name weight_bits_min/
-    max, not activation_bits."""
-    if not overrides:
-        return layer_configs
-    bits_lo, bits_hi = overrides.get("weight_bits_min"), overrides.get("weight_bits_max")
-    if isinstance(bits_lo, (int, float)) and isinstance(bits_hi, (int, float)) and bits_lo > bits_hi:
-        bits_lo = bits_hi = None
-    pruning_lo, pruning_hi = overrides.get("pruning_ratio_min"), overrides.get("pruning_ratio_max")
-    if isinstance(pruning_lo, (int, float)) and isinstance(pruning_hi, (int, float)) and pruning_lo > pruning_hi:
-        pruning_lo = pruning_hi = None
-    if bits_lo is None and bits_hi is None and pruning_lo is None and pruning_hi is None:
-        return layer_configs
-
-    clamped = []
-    for lc in layer_configs:
-        weight_bits = lc.weight_bits
-        if isinstance(bits_lo, (int, float)):
-            weight_bits = max(weight_bits, round(bits_lo))
-        if isinstance(bits_hi, (int, float)):
-            weight_bits = min(weight_bits, round(bits_hi))
-        pruning = lc.column_pruning_ratio
-        if isinstance(pruning_lo, (int, float)):
-            pruning = max(pruning, pruning_lo)
-        if isinstance(pruning_hi, (int, float)):
-            pruning = min(pruning, pruning_hi)
-        pruning = round(pruning, 4)
-        if weight_bits == lc.weight_bits and pruning == lc.column_pruning_ratio:
-            clamped.append(lc)
-        else:
-            clamped.append(lc.model_copy(update={"weight_bits": weight_bits, "column_pruning_ratio": pruning}))
-    return clamped
-
-
 def _describe_hw_bounds(hw_spec_id: str) -> str:
     try:
         hw = get_hw_config(hw_spec_id)
@@ -283,10 +253,10 @@ def _build_user_prompt(
     lines = [
         f"model_id: {state['model_id']}",
         f"hardware: {_describe_hw_bounds(state['hw_spec_id'])}",
-        f"real_model_stages (propose one layer_configs entry per stage, using these exact layer_name values): "
-        f"{[lc.layer_name for lc in stage_configs]}",
+        f"real_model_stages: {[lc.layer_name for lc in stage_configs]}",
         # Each stage below was searched independently ({search_tag}) -- not
-        # one flat point fanned out by a fixed rule.
+        # one flat point fanned out by a fixed rule. This is the final
+        # config; you are explaining it, not proposing an alternative.
         f"per_stage_suggested_candidate ({search_tag}): {suggested}",
         f"iteration_count: {state.get('iteration_count', 0)}",
         f"recent_failure_history: {state.get('failure_history', [])[-3:]}",
@@ -307,26 +277,30 @@ def _extract_decision(response: Any) -> PlannerLayerDecision:
     raise RuntimeError(f"planner LLM response had no {_TOOL_NAME!r} tool call: {response!r}")
 
 
-def _propose_layer_configs(
+def _explain_decision(
     state: AutoCIMState,
     overrides: Dict[str, Any],
     search_tag: str,
     stage_configs: List[LayerBitConfig],
     iteration_count: int,
-) -> Tuple[List[LayerBitConfig], str, "LLMCallRecord"]:
+) -> Tuple[str, Optional[str], Optional[str], "LLMCallRecord"]:
     """Real LLM call, retried on transient errors via `llm.invoke_with_retry`
     (rate limits/timeouts/5xx -- see llm.py), then forced through
     tool-calling. Raises `LLMCallFailed` -- carrying the real attempts/
     tokens/cost `LLMCallRecord` even for this failure, so a billable call
     that came back malformed still gets logged accurately -- on any failure
     the retry layer didn't absorb (including a well-formed response with no
-    usable tool call); the caller must catch that and fall back to
-    `stage_configs` directly. `get_planner_chat_model()` itself raising
-    (e.g. missing API key/model env var) is not caught here -- that's a
-    config problem retrying can't fix, and has no LLM call to build a
-    record from; the caller handles it as a plain exception. This overall
-    containment mirrors `middleware.wrap_tool_call`'s containment of
-    backend-tool exceptions."""
+    usable tool call); the caller must catch that and fall back to its own
+    template rationale. `get_planner_chat_model()` itself raising (e.g.
+    missing API key/model env var) is not caught here -- that's a config
+    problem retrying can't fix, and has no LLM call to build a record from;
+    the caller handles it as a plain exception. This overall containment
+    mirrors `middleware.wrap_tool_call`'s containment of backend-tool
+    exceptions.
+
+    Returns `(rationale, rationale_ko, anomaly_note, usage_record)` --
+    notably no `layer_configs`: `stage_configs` (the search's own output)
+    is what the caller actually uses, unconditionally (module docstring)."""
     chat_model = get_planner_chat_model().bind_tools([PlannerLayerDecision], tool_choice=_TOOL_NAME)
     response, usage_record = invoke_with_retry(
         chat_model,
@@ -343,27 +317,34 @@ def _propose_layer_configs(
         usage_record.succeeded = False
         usage_record.error = f"{type(exc).__name__}: {exc}"
         raise LLMCallFailed(usage_record) from exc
-    return decision.layer_configs, decision.rationale, usage_record
+    return decision.rationale, decision.rationale_ko, decision.anomaly_note, usage_record
 
 
 def planner_node(state: AutoCIMState) -> Dict[str, Any]:
     iteration_count = state.get("iteration_count", 0) + 1
-    overrides = state.get("human_overrides", {})  # read once, before clearing
+    new_overrides = state.get("human_overrides", {})  # read once, before clearing
+    # Merge, not replace: bounds a researcher already approved in an earlier
+    # HITL round must keep applying alongside (or be narrowed further by) a
+    # newly-approved one, not be dropped the moment a different key changes.
+    overrides = merge_dicts(state.get("search_bound_overrides", {}), new_overrides)
 
     update: Dict[str, Any] = {"iteration_count": iteration_count}
     messages: List[Dict[str, Any]] = []
 
-    if overrides:
+    if new_overrides:
         # Sanitize immediately after consuming (checklist item 3): prevents
-        # this override / the HITL flag / the retry counter that triggered
-        # it from leaking into the next iteration.
+        # the HITL flag / the retry counter that triggered it from leaking
+        # into the next iteration. The approved bounds themselves are NOT
+        # transient -- they persist in search_bound_overrides (merged above)
+        # for the rest of the run, not just this one candidate.
         update["human_overrides"] = {}
+        update["search_bound_overrides"] = new_overrides
         update["needs_hitl"] = False
         update["retry_count"] = 0
         messages.append(
             {
                 "role": "system",
-                "content": f"[planner] applied human_overrides at iteration {iteration_count}: {overrides}",
+                "content": f"[planner] applied human_overrides at iteration {iteration_count}: {new_overrides}",
             }
         )
 
@@ -371,6 +352,14 @@ def planner_node(state: AutoCIMState) -> Dict[str, Any]:
     stage_points, search_tag = _propose_stage_points(state, stage_names, overrides)
     stage_configs = points_to_stage_configs(stage_points, stage_names)
 
+    # stage_configs is what actually reaches @tuner on every path below,
+    # whether or not the LLM call even runs -- the LLM only ever supplies
+    # rationale/rationale_ko/anomaly_note now (module docstring: it no
+    # longer proposes layer_configs itself). No separate post-hoc bounds
+    # clamp is needed either: stage_configs already came from
+    # search_bounds(state["hw_spec_id"], overrides) above, so it's
+    # override-aware and hw-ceiling-safe by construction.
+    anomaly_note: Optional[str] = None
     budget_status = check_budget(state.get("llm_usage", []))
     if budget_status.exceeded:
         # Kill-switch: skip the LLM call entirely (never even constructs a
@@ -381,13 +370,13 @@ def planner_node(state: AutoCIMState) -> Dict[str, Any]:
         usage_record = LLMCallRecord(
             node="planner", iteration=iteration_count, attempts=0, succeeded=False, latency_ms=0.0, error=budget_status.reason
         )
-        layer_configs = stage_configs
         rationale = f"LLM call skipped: {budget_status.reason}"
+        rationale_ko = None  # fixed English template, not an LLM output to translate
         messages.append({"role": "system", "content": f"[planner] {rationale}; using the {search_tag} search point directly"})
     else:
         used_llm = True
         try:
-            layer_configs, rationale, usage_record = _propose_layer_configs(
+            rationale, rationale_ko, anomaly_note, usage_record = _explain_decision(
                 state, overrides, search_tag, stage_configs, iteration_count
             )
             messages.append(
@@ -399,34 +388,34 @@ def planner_node(state: AutoCIMState) -> Dict[str, Any]:
         except LLMCallFailed as exc:  # a real LLM call happened (possibly after retries) but didn't pan out
             used_llm = False
             usage_record = exc.record
-            layer_configs = stage_configs
             rationale = f"LLM proposal failed after {usage_record.attempts} attempt(s) ({usage_record.error})"
+            rationale_ko = None
             messages.append({"role": "system", "content": f"[planner] {rationale}; using the {search_tag} search point directly"})
         except Exception as exc:  # no LLM call was ever made (e.g. get_planner_chat_model() config error)
             used_llm = False
             usage_record = LLMCallRecord(
                 node="planner", iteration=iteration_count, attempts=0, succeeded=False, latency_ms=0.0, error=f"{type(exc).__name__}: {exc}"
             )
-            layer_configs = stage_configs
             rationale = f"LLM proposal failed ({type(exc).__name__}: {exc})"
+            rationale_ko = None
             messages.append({"role": "system", "content": f"[planner] {rationale}; using the {search_tag} search point directly"})
 
-    # Re-clamped even on the non-LLM fallback paths (a no-op there, since
-    # stage_configs already came from the override-aware bounds above) --
-    # one enforcement point for every path instead of trusting each branch
-    # to have respected overrides on its own.
-    layer_configs = _clamp_layer_configs(layer_configs, overrides)
-    layer_config_dicts = [lc.model_dump(mode="json") for lc in layer_configs]
+    layer_config_dicts = [lc.model_dump(mode="json") for lc in stage_configs]
     update["planned_layer_configs"] = layer_config_dicts
+    update["planner_flagged_anomaly"] = anomaly_note
     update["llm_usage"] = [usage_record.to_dict()]
     decision_entry = {
         "iteration": iteration_count,
         "search_tag": search_tag,
         "used_llm": used_llm,
         "rationale": rationale,
+        "rationale_ko": rationale_ko,
+        "anomaly_note": anomaly_note,
         "layer_configs": layer_config_dicts,
     }
     update["planner_decisions"] = [decision_entry]
+    if anomaly_note:
+        messages.append({"role": "system", "content": f"[planner] anomaly flagged at iteration {iteration_count}: {anomaly_note}"})
     log_event(
         run_id_for(state),
         node="planner",
@@ -435,6 +424,7 @@ def planner_node(state: AutoCIMState) -> Dict[str, Any]:
         search_tag=search_tag,
         used_llm=used_llm,
         rationale=rationale,
+        anomaly_note=anomaly_note,
         n_stages=len(stage_names),
     )
     update["messages"] = messages
