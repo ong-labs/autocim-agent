@@ -46,6 +46,7 @@ from schemas.tools import (
 )
 from state import AutoCIMState
 from tools.search import compute_pareto_rank
+from tools.targets import check_targets  # noqa: F401 -- re-exported; see tools/targets.py's docstring
 
 MAX_RETRY_LIMIT = 3
 
@@ -78,32 +79,6 @@ def validate_metrics(metrics: Dict[str, Any]) -> List[str]:
         if parsed.status != ToolStatus.SUCCESS:
             validation_errors.append(f"{node_name}: status={parsed.status}, error={parsed.error}")
     return validation_errors
-
-
-def check_targets(
-    accuracy: Optional[float],
-    energy_pj: Optional[float],
-    noc_latency_ms: Optional[float],
-    target_accuracy: Optional[float],
-    target_energy_pj: Optional[float],
-    target_latency_ms: Optional[float],
-) -> List[str]:
-    """Human-readable reasons any *configured* target wasn't met -- empty
-    if every configured target is satisfied, or none are configured at
-    all (the default: this dimension simply isn't gated). Accuracy is
-    higher-is-better (must be >= target); energy/latency are
-    lower-is-better (must be <= target). A missing metric value (`None`)
-    can never be judged as meeting a configured target -- same "incomplete
-    data is never silently fine" rule `validate_metrics` already applies,
-    just for target-achievement instead of schema validity."""
-    reasons = []
-    if target_accuracy is not None and (accuracy is None or accuracy < target_accuracy):
-        reasons.append(f"accuracy {accuracy} below target {target_accuracy}")
-    if target_energy_pj is not None and (energy_pj is None or energy_pj > target_energy_pj):
-        reasons.append(f"energy_pj {energy_pj} above target {target_energy_pj}")
-    if target_latency_ms is not None and (noc_latency_ms is None or noc_latency_ms > target_latency_ms):
-        reasons.append(f"noc_latency_ms {noc_latency_ms} above target {target_latency_ms}")
-    return reasons
 
 
 def build_candidate_entry(
@@ -205,7 +180,13 @@ def evaluator_node(state: AutoCIMState) -> Dict[str, Any]:
         return {"is_converged": True, "needs_hitl": False, "candidate_history": candidate_history}
 
     new_retry_count = retry_count + 1
-    needs_hitl = new_retry_count >= MAX_RETRY_LIMIT
+    # planner_flagged_anomaly (state.py): @planner's LLM sets this fresh
+    # every iteration (nodes/planner.py), so it's always this iteration's
+    # own value, never a stale one from an earlier call -- an anomaly
+    # pulls in a researcher immediately instead of waiting for
+    # MAX_RETRY_LIMIT routine misses to accumulate.
+    anomaly_note = state.get("planner_flagged_anomaly")
+    needs_hitl = new_retry_count >= MAX_RETRY_LIMIT or bool(anomaly_note)
     if validation_errors:
         reason = "; ".join(validation_errors)
     elif not hw_verified:
@@ -226,6 +207,7 @@ def evaluator_node(state: AutoCIMState) -> Dict[str, Any]:
         needs_hitl=needs_hitl,
         retry_count=new_retry_count,
         reason=failure_entry["reason"],
+        anomaly_note=anomaly_note,
         accuracy=(candidate_entry or {}).get("accuracy"),
         energy_pj=(candidate_entry or {}).get("energy_pj"),
         noc_latency_ms=(candidate_entry or {}).get("noc_latency_ms"),
