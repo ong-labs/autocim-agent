@@ -36,6 +36,69 @@ def test_model_registry_covers_resnet18_mobilenet_v2_and_vit_tiny():
     assert all(callable(builder) for builder in _MODEL_REGISTRY.values())
 
 
+# --- group_quantizable_layers against the three real registered architectures ---
+#
+# The tests above only ever exercise `_stage_of`'s digit-aware grouping
+# against small hand-built stand-ins (_TwoStageModel/_RepeatingBlockModel).
+# `_MODEL_REGISTRY`'s actual builders (`_build_mobilenet_v2`/`_build_vit_tiny`)
+# always request pretrained ImageNet weights, so nothing in this no-network
+# suite ever built these two real architectures at all -- a real breakage in
+# `_stage_of` against mobilenet_v2/vit_tiny's real module tree (e.g. a
+# torchvision/timm version bump changing attribute names) could go
+# undetected. `weights=None`/`pretrained=False` construct the identical
+# module tree with random init and no download, so these stay real
+# architecture tests without adding any network dependency to the suite.
+
+
+def test_group_quantizable_layers_against_real_resnet18_architecture():
+    import torchvision.models as tv_models
+
+    groups = group_quantizable_layers(tv_models.resnet18(weights=None))
+
+    # 4 stages x 2 BasicBlocks each (resnet18's [2, 2, 2, 2] layout) plus the
+    # stem conv and final fc -- exactly what get_qat_backend's docstring
+    # claims ("conv1/layer1..layer4/fc"), not collapsed or split differently.
+    assert set(groups.keys()) == {
+        "conv1",
+        "layer1.0", "layer1.1",
+        "layer2.0", "layer2.1",
+        "layer3.0", "layer3.1",
+        "layer4.0", "layer4.1",
+        "fc",
+    }
+
+
+def test_group_quantizable_layers_against_real_mobilenet_v2_architecture():
+    import torchvision.models as tv_models
+
+    groups = group_quantizable_layers(tv_models.mobilenet_v2(weights=None))
+
+    # mobilenet_v2 nests every block under one "features" container
+    # (unlike resnet18's per-stage top-level attributes) -- this is the
+    # exact case tools/qat.py's module docstring calls out as needing
+    # _stage_of's digit-aware rule: a plain "first segment only" grouping
+    # would collapse all 19 feature blocks into a single "features" group.
+    assert "features" not in groups
+    feature_groups = {key for key in groups if key.startswith("features.")}
+    assert len(feature_groups) == 19  # features.0 .. features.18
+    assert "classifier.1" in groups
+
+
+def test_group_quantizable_layers_against_real_vit_tiny_architecture():
+    import timm
+
+    model = timm.create_model("vit_tiny_patch16_224", pretrained=False, num_classes=10)
+    groups = group_quantizable_layers(model)
+
+    # Same digit-aware concern as mobilenet_v2, for vit_tiny's transformer
+    # blocks: 12 real blocks (vit_tiny_patch16_224's depth), not one
+    # collapsed "blocks" group.
+    assert "blocks" not in groups
+    block_groups = {key for key in groups if key.startswith("blocks.")}
+    assert len(block_groups) == 12  # blocks.0 .. blocks.11
+    assert "head" in groups
+
+
 class _TwoStageModel(nn.Module):
     """Two distinct real top-level stages, neither one a numeric-indexed
     container child -- exercises `group_quantizable_layers`'s basic
@@ -135,6 +198,10 @@ def test_apply_crossbar_quant_prune_zeroes_expected_fraction_of_output_channels(
 
 
 def test_apply_crossbar_quant_prune_snaps_weights_to_the_symmetric_grid():
+    # A single output channel (out_features=1) -- per-column scale and
+    # per-tensor scale coincide here, so this only exercises the grid
+    # formula itself, not column independence (see the per-column test
+    # below for that).
     linear = nn.Linear(4, 1, bias=False)
     with torch.no_grad():
         # max |x| = 1.0 -> scale = 1.0 / qmax; every element must land on
@@ -151,9 +218,115 @@ def test_apply_crossbar_quant_prune_snaps_weights_to_the_symmetric_grid():
     assert torch.allclose(linear.weight.detach().flatten(), expected, atol=1e-6)
 
 
+def test_fake_quant_scales_each_output_channel_independently():
+    """Column-wise quantization: each output channel ("crossbar column")
+    gets its own scale, not one scale shared across the whole layer.
+    Channel 0's weights are 100x larger than channel 1's; a single shared
+    per-tensor scale (sized off channel 0's max) would round channel 1's
+    much smaller values all the way down to 0, losing that column's
+    weights entirely."""
+    linear = nn.Linear(2, 2, bias=False)
+    with torch.no_grad():
+        linear.weight.copy_(torch.tensor([[10.0, -10.0], [0.1, -0.1]]))
+
+    apply_crossbar_quant_prune(linear, stage_configs={}, default_config=(4, 0.0))
+
+    quantized = linear.weight.detach()
+    # Channel 1 (small magnitudes) must still be distinguishable from zero
+    # and from each other -- a shared per-tensor scale derived from
+    # channel 0's max=10.0 would collapse both to exactly 0.0.
+    assert quantized[1, 0] != 0.0
+    assert quantized[1, 0] != quantized[1, 1]
+
+
 def test_gradient_flows_through_fake_quant_via_straight_through_estimator():
     conv = nn.Conv2d(3, 4, kernel_size=3, padding=1)
     apply_crossbar_quant_prune(conv, stage_configs={}, default_config=(4, 0.0))
+
+    x = torch.randn(2, 3, 8, 8)
+    loss = conv(x).sum()
+    loss.backward()
+
+    assert conv.parametrizations.weight.original.grad is not None
+    assert torch.any(conv.parametrizations.weight.original.grad != 0)
+
+
+# --- Column-wise partial-sum quantization (adc_bits) -------------------------
+
+
+def test_apply_crossbar_quant_prune_skips_partial_sum_quantization_by_default():
+    """adc_bits=None (the default) must leave the module's output
+    untouched -- backward compatible with every caller that predates this
+    parameter (e.g. tests above, which never pass it)."""
+    linear = nn.Linear(4, 2, bias=False)
+    with torch.no_grad():
+        linear.weight.copy_(torch.ones(2, 4))
+    apply_crossbar_quant_prune(linear, stage_configs={}, default_config=(8, 0.0))
+
+    x = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
+    output = linear(x)
+    expected = x @ linear.weight.detach().t()  # weight already reflects its own quantization
+    assert torch.allclose(output, expected, atol=1e-5)
+
+
+def test_partial_sum_quant_scales_each_output_channel_independently():
+    """Column-wise partial-sum quantization: two output channels with very
+    different accumulated magnitudes must each get their own ADC-precision
+    scale -- a scale shared across the whole output (sized off the larger
+    channel) would round the smaller channel's partial sum to 0."""
+    linear = nn.Linear(1, 2, bias=False)
+    with torch.no_grad():
+        linear.weight.copy_(torch.tensor([[10.0], [0.1]]))
+
+    apply_crossbar_quant_prune(linear, stage_configs={}, default_config=(8, 0.0), adc_bits=4)
+
+    output = linear(torch.tensor([[1.0]]))
+    assert output[0, 1].item() != 0.0
+
+
+def test_partial_sum_quant_snaps_output_to_the_adc_grid():
+    linear = nn.Linear(1, 1, bias=False)
+    with torch.no_grad():
+        linear.weight.copy_(torch.tensor([[1.0]]))
+    apply_crossbar_quant_prune(linear, stage_configs={}, default_config=(8, 0.0), adc_bits=3)
+
+    # Batch of 2 so the one output channel sees two different values --
+    # scale is derived from the batch max (1.0), so 0.3 actually lands on
+    # a grid point other than itself, proving real quantization happened
+    # (not just an identity pass-through).
+    output = linear(torch.tensor([[1.0], [0.3]]))
+
+    qmax = 2 ** (3 - 1) - 1  # 3
+    scale = 1.0 / qmax
+    expected = torch.round(torch.tensor([1.0, 0.3]) / scale) * scale
+    assert torch.allclose(output.detach().flatten(), expected, atol=1e-6)
+    assert output.detach()[1, 0].item() != pytest.approx(0.3)
+
+
+def test_partial_sum_quant_uses_adc_bits_not_the_per_stage_weight_bits():
+    """adc_bits is a single hw-wide value (HWConfig.adc_bits), applied the
+    same way regardless of a stage's own weight_bits -- two stages with
+    very different weight_bits must still see identically-precise
+    partial-sum quantization."""
+    model = nn.ModuleDict({"a": nn.Linear(1, 1, bias=False), "b": nn.Linear(1, 1, bias=False)})
+    with torch.no_grad():
+        model["a"].weight.copy_(torch.tensor([[1.0]]))
+        model["b"].weight.copy_(torch.tensor([[1.0]]))
+    apply_crossbar_quant_prune(
+        model, stage_configs={"a": (2, 0.0), "b": (8, 0.0)}, default_config=(8, 0.0), adc_bits=3
+    )
+
+    out_a = model["a"](torch.tensor([[1.0], [0.3]])).detach()
+    out_b = model["b"](torch.tensor([[1.0], [0.3]])).detach()
+    # Both stages' weight (1.0) is lossless at either 2 or 8 bits, so any
+    # difference here comes only from partial-sum quantization -- which
+    # must be identical since both share the same adc_bits.
+    assert torch.allclose(out_a, out_b, atol=1e-6)
+
+
+def test_gradient_flows_through_partial_sum_quant():
+    conv = nn.Conv2d(3, 4, kernel_size=3, padding=1)
+    apply_crossbar_quant_prune(conv, stage_configs={}, default_config=(8, 0.0), adc_bits=6)
 
     x = torch.randn(2, 3, 8, 8)
     loss = conv(x).sum()
