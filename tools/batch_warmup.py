@@ -46,10 +46,13 @@ differences, not incidental shortcuts:
 GPU note: if `tools.qat._resolve_device` resolves to a single GPU (the
 common case), every worker thread's QAT trial targets that same GPU --
 unlike CPU parallelism across cores, concurrent trials here compete for
-one device's memory. Keep `max_workers` modest (or force
-`AUTOCIM_QAT_DEVICE=cpu` for this step specifically) if warm-up starts
-hitting out-of-memory errors; this module does not attempt to manage GPU
-memory itself.
+one device's memory, and can also crash outright (observed: "CUDA error:
+invalid resource handle" from a BatchNorm forward call under concurrent
+cudnn use from multiple threads) rather than just running slower or
+hitting OOM. `main.py`'s caller defaults `max_workers` to 1 on a single
+CUDA device for exactly this reason; pass `--parallel-warmup-workers`
+explicitly to opt into more than 1 worker there. This module does not
+attempt to manage GPU memory/context safety itself.
 
 Known limitation, accepted rather than solved here: if a warm-up candidate
 happens to converge, this module still records it (correctly, at real
@@ -65,8 +68,8 @@ change to `main.py` beyond this module's scope, not attempted here.
 from __future__ import annotations
 
 import os
-from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from nodes.evaluator import build_candidate_entry, validate_metrics
 from nodes.planner import points_to_stage_configs, real_stage_names, search_bounds, search_seed_for, warmup_count
@@ -164,16 +167,38 @@ def run_parallel_warmup(
     hw_config: HWConfig,
     calibration_factors: Optional[Dict[str, float]] = None,
     max_workers: Optional[int] = None,
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    on_progress: Optional[Callable[[int, int], None]] = None,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Evaluates every LHS warm-up candidate for `(model_id, hw_config)`
-    concurrently and returns `(candidate_history_entries, failure_entries)`
-    -- ready to seed `AutoCIMState.candidate_history`/`failure_history`
+    concurrently and returns `(candidate_history_entries, failure_entries,
+    planner_decisions_entries)` -- ready to seed
+    `AutoCIMState.candidate_history`/`failure_history`/`planner_decisions`
     (state.py) before `main.py`'s sequential graph loop starts.
     `calibration_factors` should be the same dict `main.py` seeds into the
     initial state (`tools.calibration.bootstrap_calibration_factors`) --
     passed through to every trial's `profiler_tool` call so warm-up
     candidates' energy figures are corrected exactly like the sequential
     path's would be, not silently left uncalibrated.
+
+    The `planner_decisions` entries exist purely so `tools/dashboard.py`'s
+    `_iteration_rows` (which joins `candidate_history` against
+    `planner_decisions` by iteration number) has something to show in the
+    "search phase"/"rationale" columns for these candidates -- without them
+    those columns rendered as a bare "-", identical in look to a genuinely
+    missing/corrupted decision (`_iteration_rows`'s own
+    "no matching planner_decisions entry" fallback case), even though a
+    real evaluated candidate exists. `search_tag` uses the exact
+    `"LHS warm-up candidate {i}/{n}"` text `nodes/planner.py`'s own
+    sequential warm-up path produces, so `tools/dashboard.py`'s
+    `_WARMUP_TAG_RE`/`_search_phase_summary_html` recognize these rows
+    identically either way. `used_llm=False`: this path deliberately skips
+    the LLM confirmation step (module docstring above), so `rationale`/
+    `rationale_ko` are this module's own fixed EN/KO text, not a
+    per-candidate LLM justification -- unlike the sequential path's
+    LLM-failure fallback text, this one is only ever reached because of
+    the *design* choice to skip the LLM here, not a failure, so it says so
+    plainly rather than reusing "LLM proposal failed" wording that implies
+    something went wrong.
 
     Pareto rank is computed in a second, sequential pass (by warm-up index,
     ascending -- the same order the sequential graph loop would have
@@ -182,7 +207,14 @@ def run_parallel_warmup(
     rank depend on how many sibling threads happened to finish first, a
     race with no well-defined answer. `max_workers` defaults to
     `min(n_warmup, cpu_count)` -- never more threads than there are
-    candidates, and not more than this machine's real core count."""
+    candidates, and not more than this machine's real core count.
+
+    `on_progress(completed, total)`, if given, is called once per
+    candidate as it finishes -- in *completion* order, not submission
+    order, since these genuinely run concurrently and there's no
+    well-defined "which one should finish first". Each real QAT trial can
+    take minutes, and this whole batch otherwise produces no output at all
+    until every candidate is done -- easy to mistake for a hang."""
     stage_names = real_stage_names(model_id)
     bit_bounds, pruning_bounds = search_bounds(hw_config.hw_spec_id)
     n_warmup = warmup_count(len(stage_names))
@@ -194,30 +226,38 @@ def run_parallel_warmup(
     resolved_max_workers = max_workers if max_workers is not None else min(n_warmup, os.cpu_count() or 1)
     resolved_max_workers = max(1, resolved_max_workers)
 
+    total = len(layer_configs_per_candidate)
+    raw_metrics_by_index: List[Optional[Dict[str, Any]]] = [None] * total
     with ThreadPoolExecutor(max_workers=resolved_max_workers) as executor:
-        raw_metrics_by_index = list(
-            executor.map(
-                lambda layer_configs: _evaluate_one_candidate(model_id, hw_config, layer_configs, calibration_factors),
-                layer_configs_per_candidate,
-            )
-        )
+        future_to_index = {
+            executor.submit(_evaluate_one_candidate, model_id, hw_config, layer_configs, calibration_factors): idx
+            for idx, layer_configs in enumerate(layer_configs_per_candidate)
+        }
+        completed = 0
+        for future in as_completed(future_to_index):
+            raw_metrics_by_index[future_to_index[future]] = future.result()
+            completed += 1
+            if on_progress is not None:
+                on_progress(completed, total)
 
     candidate_history: List[Dict[str, Any]] = []
     failure_history: List[Dict[str, Any]] = []
+    planner_decisions: List[Dict[str, Any]] = []
     for warmup_index, metrics in enumerate(raw_metrics_by_index):
+        iteration = warmup_index + 1
         validation_errors = validate_metrics(metrics)
         verifier_data = (metrics.get("verifier") or {}).get("data") or {}
         is_converged = not validation_errors and bool(verifier_data.get("is_converged", False))
 
         candidate_entry = build_candidate_entry(
-            candidate_history, metrics, warmup_index + 1, is_converged, has_validation_errors=bool(validation_errors)
+            candidate_history, metrics, iteration, is_converged, has_validation_errors=bool(validation_errors)
         )
         if candidate_entry is not None:
             candidate_history.append(candidate_entry)
         else:
             failure_history.append(
                 {
-                    "iteration": warmup_index + 1,
+                    "iteration": iteration,
                     "retry_count": 0,
                     "reason": (
                         "; ".join(validation_errors) if validation_errors else "verifier reported not converged"
@@ -225,5 +265,21 @@ def run_parallel_warmup(
                     + " (parallel warm-up candidate)",
                 }
             )
+        planner_decisions.append(
+            {
+                "iteration": iteration,
+                "search_tag": f"LHS warm-up candidate {iteration}/{n_warmup}",
+                "used_llm": False,
+                "rationale": (
+                    "Evaluated directly from Latin Hypercube sampling (parallel warm-up batch) -- "
+                    "no LLM confirmation for this candidate (tools/batch_warmup.py)."
+                ),
+                "rationale_ko": (
+                    "라틴 하이퍼큐브 샘플링(LHS)으로 직접 평가된 후보입니다 (병렬 워밍업 배치) -- "
+                    "이 후보는 LLM 확인을 거치지 않았습니다 (tools/batch_warmup.py)."
+                ),
+                "layer_configs": [lc.model_dump(mode="json") for lc in layer_configs_per_candidate[warmup_index]],
+            }
+        )
 
-    return candidate_history, failure_history
+    return candidate_history, failure_history, planner_decisions
