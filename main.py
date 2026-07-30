@@ -147,11 +147,14 @@ def parse_args() -> argparse.Namespace:
         default=None,
         metavar="N",
         help=(
-            "Opt-in: evaluate the LHS warm-up candidates (tools/batch_warmup.py) "
-            "concurrently across N threads before the sequential graph loop starts, "
-            "instead of one real QAT trial per graph iteration. Only applies to a "
-            "brand-new session (not a resumed/paused one). Omit to keep today's "
-            "fully-sequential behavior."
+            "Worker-count override for the LHS warm-up batch (tools/batch_warmup.py): "
+            "every warm-up candidate always runs up front, concurrently, before the "
+            "sequential graph loop starts (so warm-up never pauses for a HITL prompt) -- "
+            "only applies to a brand-new session (not a resumed/paused one). Omit to use "
+            "the default: min(warm-up candidates, CPU cores) on CPU/MPS, or 1 on a single "
+            "CUDA device (concurrent CUDA/cudnn calls from multiple threads on one GPU can "
+            "crash, not just contend for memory -- pass this explicitly to opt into more "
+            "than 1 worker on CUDA)."
         ),
     )
     parser.add_argument(
@@ -210,18 +213,19 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--allow-approximate-calibration",
+        "--exact-calibration-only",
         action="store_true",
         help=(
-            "Opt-in: when --hw-config doesn't exactly match a known "
-            "calibration reference (tools/calibration.py's KNOWN_REFERENCES), "
-            "fall back to the nearest reference's scaling-law-transferred "
-            "correction factor instead of leaving @profiler uncalibrated "
-            "(factor 1.0). The result is tagged 'approximate' in "
-            "calibration_provenance, with the matched reference and distance "
-            "printed at session start -- never presented as an exact "
-            "citation. Omit to keep the default: an unmatched hw_config "
-            "stays honestly uncalibrated."
+            "Opt-out: by default, when --hw-config doesn't exactly match a "
+            "known calibration reference (tools/calibration.py's "
+            "KNOWN_REFERENCES), a session falls back to the nearest "
+            "reference's scaling-law-transferred correction factor instead "
+            "of leaving @profiler uncalibrated (factor 1.0) -- tagged "
+            "'approximate' in calibration_provenance, with the matched "
+            "reference and distance printed at session start, never "
+            "presented as an exact citation. Pass this flag to keep the "
+            "stricter behavior instead: an unmatched hw_config stays "
+            "honestly uncalibrated."
         ),
     )
     return parser.parse_args()
@@ -468,8 +472,8 @@ def _prompt_approx_calibration(current: Any, answers: Dict[str, Any]) -> Any:
         f"{reference.crossbar_rows}x{reference.crossbar_cols}/{reference.adc_bits}-bit ADC "
         f"(distance={distance:.2f})"
     )
-    default = current if current in ("y", "n") else "n"
-    raw = input("  이 레퍼런스로 근사 보정해서 진행할까요? [y/n]: ").strip().lower()
+    default = current if current in ("y", "n") else "y"
+    raw = input("  이 레퍼런스로 근사 보정해서 진행할까요? (기본값: 예) [y/n]: ").strip().lower()
     if raw in _BACK_COMMANDS:
         return _BACK
     if not raw:
@@ -539,8 +543,11 @@ def _prompt_save_custom_hw_config(current: Any, answers: Dict[str, Any]) -> Any:
 def _build_wizard_steps(
     args: argparse.Namespace, thread_id: str, initial_custom_defaults: Dict[str, Any], report_timestamp: datetime
 ) -> List[_WizardStep]:
-    is_custom = lambda answers: answers.get("hw_mode") == "1"
-    is_example = lambda answers: answers.get("hw_mode") == "2"
+    def is_custom(answers: Dict[str, Any]) -> bool:
+        return answers.get("hw_mode") == "1"
+
+    def is_example(answers: Dict[str, Any]) -> bool:
+        return answers.get("hw_mode") == "2"
 
     steps = [_WizardStep("hw_mode", "hw-config 선택 방식", _prompt_hw_mode)]
     for name, read_fn in _CUSTOM_HW_CONFIG_STEPS:
@@ -807,15 +814,16 @@ def build_initial_state(
     target_accuracy: Optional[float] = None,
     target_energy_pj: Optional[float] = None,
     target_latency_ms: Optional[float] = None,
-    allow_approximate_calibration: bool = False,
+    allow_approximate_calibration: bool = True,
 ) -> AutoCIMState:
     if allow_approximate_calibration:
-        # --allow-approximate-calibration: nearest-KNOWN_REFERENCES fallback
-        # (tools/calibration.py) when hw_config has no exact match. When it
-        # *does* have an exact match, this returns the identical factor
-        # bootstrap_calibration_factors would (distance 0 to that same
-        # reference) -- so opting in never changes an already-exact-matched
-        # session, only rescues an otherwise-uncalibrated one.
+        # Default: nearest-KNOWN_REFERENCES fallback (tools/calibration.py)
+        # when hw_config has no exact match. When it *does* have an exact
+        # match, this returns the identical factor bootstrap_calibration_factors
+        # would (distance 0 to that same reference) -- so this never changes
+        # an already-exact-matched session, only rescues an otherwise-
+        # uncalibrated one. --exact-calibration-only (main.py's CLI) opts
+        # back into the stricter behavior below.
         calibration_factors = bootstrap_approximate_calibration_factors(hw_config)
         calibration_provenance = bootstrap_approximate_calibration_provenance(hw_config)
     else:
@@ -841,6 +849,7 @@ def build_initial_state(
         "calibration_provenance": calibration_provenance,
         "human_overrides": {},
         "planned_layer_configs": [],
+        "planner_flagged_anomaly": None,
         "model_id": model_id,
         "hw_spec_id": hw_config.hw_spec_id,
         "target_accuracy": target_accuracy,
@@ -859,6 +868,14 @@ def build_initial_state(
 _AUTO_HITL_GAP_TIER_THRESHOLDS = (0.15, 0.4)  # <15% / 15-40% / >=40% relative miss
 _AUTO_HITL_BITS_STEP_TIERS = (1, 2, 3)
 _AUTO_HITL_PRUNING_STEP_TIERS = (0.1, 0.2, 0.3)
+
+# suggest_override_bounds() only ever narrows one end of weight_bits/
+# column_pruning_ratio's range -- these are the minimum width to leave on
+# the narrowed end away from the untouched other end, so a tier-2 (biggest-
+# miss) step can't pin a dimension to a single value and leave the search
+# with nothing left to search (see suggest_override_bounds's docstring).
+_MIN_BITS_SEARCH_MARGIN = 1
+_MIN_PRUNING_SEARCH_MARGIN = 0.05
 
 
 def _gap_tier(gap_ratio: float) -> int:
@@ -965,21 +982,53 @@ def suggest_override_bounds(interrupt_payload: Dict[str, Any]) -> Optional[Dict[
     pruning_step = _AUTO_HITL_PRUNING_STEP_TIERS[tier]
 
     # Same bounds the real search is confined to (hw_spec_id's physical
-    # ADC/DAC ceiling + this project's policy floor/ceiling) -- a large-tier
-    # suggestion is clamped here rather than proposing something outside
-    # what nodes/planner.py's search_bounds()/_clamp_layer_configs() would
-    # even accept (silently ignored downstream if it inverted the range).
-    (bits_floor, bits_ceiling), (pruning_floor, pruning_ceiling) = search_bounds(interrupt_payload.get("hw_spec_id") or "")
+    # ADC/DAC ceiling + this project's policy floor/ceiling, further
+    # narrowed by whatever this run's researcher has already approved --
+    # search_bound_overrides) -- a large-tier suggestion is clamped here
+    # rather than proposing something outside what nodes/planner.py's
+    # search_bounds() would even accept (silently ignored downstream if it
+    # inverted the range). Passing search_bound_overrides through is what
+    # keeps a *later* HITL round's suggestion from silently regressing an
+    # earlier round's approved bound back toward the hw's raw ceiling --
+    # without it, every round computes as if it were the first one ever.
+    (bits_floor, bits_ceiling), (pruning_floor, pruning_ceiling) = search_bounds(
+        interrupt_payload.get("hw_spec_id") or "", interrupt_payload.get("search_bound_overrides")
+    )
 
     if wants_precision:
-        return {
-            "weight_bits_min": min(bits_ceiling, round(current_bits) + bits_step),
-            "pruning_ratio_max": max(pruning_floor, round(current_pruning - pruning_step, 4)),
-        }
-    return {
-        "weight_bits_max": max(bits_floor, round(current_bits) - bits_step),
-        "pruning_ratio_min": min(pruning_ceiling, round(current_pruning + pruning_step, 4)),
-    }
+        weight_bits_min = min(bits_ceiling, round(current_bits) + bits_step)
+        pruning_ratio_max = max(pruning_floor, round(current_pruning - pruning_step, 4))
+        # This override only sets weight_bits_min/pruning_ratio_max -- the
+        # *other* end of each range (weight_bits_max/pruning_ratio_min)
+        # stays wherever it already was (bits_ceiling/pruning_floor, since
+        # nothing here narrows it), so a tier-2 (biggest-miss) step landing
+        # exactly on that other end pins the whole dimension to one value:
+        # every later surrogate-model proposal would then be forced
+        # identical -- not a narrower search, no search left at all (this
+        # is exactly what happened in production: a >=40% accuracy miss on
+        # a dac_bits=4 hw_spec, whose weight_bits ceiling was already only
+        # 4, pinned weight_bits to {4} and pruning_ratio to {0.0} in one
+        # step). Pull the suggestion back just enough to leave
+        # _MIN_BITS_SEARCH_MARGIN/_MIN_PRUNING_SEARCH_MARGIN of real range,
+        # unless the hw_spec's own floor..ceiling was already narrower than
+        # that margin -- there's no room to leave in that case regardless.
+        if bits_ceiling - bits_floor >= _MIN_BITS_SEARCH_MARGIN:
+            weight_bits_min = min(weight_bits_min, bits_ceiling - _MIN_BITS_SEARCH_MARGIN)
+        if pruning_ceiling - pruning_floor >= _MIN_PRUNING_SEARCH_MARGIN:
+            pruning_ratio_max = max(pruning_ratio_max, pruning_floor + _MIN_PRUNING_SEARCH_MARGIN)
+        return {"weight_bits_min": weight_bits_min, "pruning_ratio_max": pruning_ratio_max}
+
+    weight_bits_max = max(bits_floor, round(current_bits) - bits_step)
+    pruning_ratio_min = min(pruning_ceiling, round(current_pruning + pruning_step, 4))
+    # Mirror image of the wants_precision case above: weight_bits_min/
+    # pruning_ratio_max stay at bits_floor/pruning_ceiling here, so a
+    # tier-2 step landing on bits_floor/pruning_ceiling would pin those
+    # dimensions the same way.
+    if bits_ceiling - bits_floor >= _MIN_BITS_SEARCH_MARGIN:
+        weight_bits_max = max(weight_bits_max, bits_floor + _MIN_BITS_SEARCH_MARGIN)
+    if pruning_ceiling - pruning_floor >= _MIN_PRUNING_SEARCH_MARGIN:
+        pruning_ratio_min = min(pruning_ratio_min, pruning_ceiling - _MIN_PRUNING_SEARCH_MARGIN)
+    return {"weight_bits_max": weight_bits_max, "pruning_ratio_min": pruning_ratio_min}
 
 
 _RECOGNIZED_OVERRIDE_KEYS = {"weight_bits_min", "weight_bits_max", "pruning_ratio_min", "pruning_ratio_max"}
@@ -1027,6 +1076,8 @@ def prompt_for_override(interrupt_payload: Dict[str, Any]) -> Optional[Dict[str,
     print(f"reason         : {interrupt_payload.get('reason')}")
     print(f"iteration_count: {interrupt_payload.get('iteration_count')}")
     print(f"retry_count    : {interrupt_payload.get('retry_count')}")
+    if interrupt_payload.get("anomaly_note"):
+        print(f"⚠ anomaly      : {interrupt_payload['anomaly_note']}")
     for entry in interrupt_payload.get("failure_history") or []:
         print(f"  - iter {entry.get('iteration')}: {entry.get('reason')}")
     latest = (interrupt_payload.get("latest_metrics") or {}).get("verifier", {}).get("data") or {}
@@ -1113,7 +1164,10 @@ def _format_update(iteration: int, node_name: str, update: Dict[str, Any]) -> st
             return f"{prefix} (no decision recorded)"
         d = decisions[-1]
         llm_state = "llm=ok" if d.get("used_llm") else "llm=fallback"
-        return f"{prefix} {d.get('search_tag')} ({llm_state}) -- {_truncate(d.get('rationale'))}"
+        line = f"{prefix} {d.get('search_tag')} ({llm_state}) -- {_truncate(d.get('rationale'))}"
+        if d.get("anomaly_note"):
+            line += f"\n    ⚠ anomaly flagged: {_truncate(d['anomaly_note'], 160)}"
+        return line
 
     if node_name == "tuner":
         return f"{prefix} accuracy={data.get('accuracy')} device={data.get('device')} epochs_run={data.get('epochs_run')}"
@@ -1135,6 +1189,17 @@ def _format_update(iteration: int, node_name: str, update: Dict[str, Any]) -> st
             return f"{prefix} CONVERGED"
         failure = (update.get("failure_history") or [{}])[0]
         status = "HITL" if update.get("needs_hitl") else "not converged, retrying"
+        return f"{prefix} {status} (retry {update.get('retry_count')}) -- {failure.get('reason')}"
+
+    if node_name == "precision_verifier":
+        # Same is_converged/needs_hitl/retry_count/failure_history shape as
+        # @evaluator's own update (nodes/precision_verifier.py reuses
+        # evaluator_router) -- only reached at all once @evaluator's fast
+        # approximation already said "Converged (Done)" once this iteration.
+        if update.get("is_converged"):
+            return f"{prefix} PRECISELY CONVERGED"
+        failure = (update.get("failure_history") or [{}])[0]
+        status = "HITL" if update.get("needs_hitl") else "not precisely converged, retrying"
         return f"{prefix} {status} (retry {update.get('retry_count')}) -- {failure.get('reason')}"
 
     return f"{prefix} {update}"  # fallback for any future node this doesn't special-case yet
@@ -1259,6 +1324,22 @@ def write_dashboard(graph, config: Dict[str, Any], dashboard_out: Optional[str])
     print(f"[dashboard] wrote {dashboard_out}")
 
 
+def _pareto_store_key(model_id: str, hw_spec_id: str) -> str:
+    """`ModelSpecificStore.get/put_pareto_solutions` key used by
+    `run_session` -- deliberately (model_id, hw_spec_id) composite, not
+    model_id alone: a stored candidate's energy_pj/noc_latency_ms come from
+    `tools/cim_physics.py` running against a *specific* HWConfig, so they
+    are not comparable across two different hw_spec_ids. Seeding
+    candidate_history (below, and in run_session's fresh-session branch)
+    from a Pareto front measured on a different hw_spec_id would silently
+    mix incomparable energy/latency values into this run's Pareto-rank
+    computation, and would also desync the warm-up index (`len(history)`)
+    from this hw_spec_id's own LHS design. `ModelSpecificStore.NAMESPACE_PREFIX`
+    itself stays model_id-only, so this composite string is a caller-side
+    convention, not a store.py change."""
+    return f"{model_id}::{hw_spec_id}"
+
+
 def _persist_long_term_learnings(
     model_store: ModelSpecificStore,
     hw_store: GlobalHWStore,
@@ -1284,21 +1365,22 @@ def _persist_long_term_learnings(
     candidate_history = state_values.get("candidate_history") or []
     if not candidate_history:
         return
-    existing = (model_store.get_pareto_solutions(model_id) or {}).get("candidates", [])
+    pareto_key = _pareto_store_key(model_id, hw_spec_id)
+    existing = (model_store.get_pareto_solutions(pareto_key) or {}).get("candidates", [])
     union = existing + candidate_history
     front = [c for c in union if compute_pareto_rank(c, union) == 1]
-    model_store.put_pareto_solutions(model_id, {"candidates": front})
+    model_store.put_pareto_solutions(pareto_key, {"candidates": front})
 
 
 def _describe_calibration_status(calibration_provenance: Dict[str, Any], hw_spec_id: str) -> str:
     """One-line summary of how (or whether) `hw_spec_id` got calibrated --
     printed at fresh-session start so a researcher never has to dig into
     `calibration_provenance` just to learn whether an energy number is an
-    exact citation, a --allow-approximate-calibration extrapolation, or
+    exact citation, an approximate (nearest-reference) extrapolation, or
     uncalibrated (factor 1.0)."""
     described = calibration_provenance.get(hw_spec_id)
     if described is None:
-        return "uncalibrated (no exact match; pass --allow-approximate-calibration for a best-effort factor)"
+        return "uncalibrated (no exact or nearest-reference match; --exact-calibration-only was likely passed)"
     if described.get("approximate"):
         return (
             f"approximate (nearest reference {described['matched_crossbar_rows']}x"
@@ -1318,7 +1400,7 @@ def run_session(
     target_accuracy: Optional[float] = None,
     target_energy_pj: Optional[float] = None,
     target_latency_ms: Optional[float] = None,
-    allow_approximate_calibration: bool = False,
+    allow_approximate_calibration: bool = True,
     auto_hitl: bool = False,
     auto_hitl_max_rounds: int = 2,
 ) -> None:
@@ -1414,6 +1496,17 @@ def run_session(
             f"\nStarting new AutoCIM-Agent session: model_id={model_id!r} "
             f"hw_spec_id={hw_config.hw_spec_id!r} thread_id={thread_id!r}"
         )
+        # tools/qat.py's _DEFAULT_TRAIN_SIZE/_VAL_SIZE/_TEST_SIZE (512/128/1000)
+        # and nodes/tuner.py's _DEFAULT_MAX_EPOCHS (5) are a deliberately
+        # small CIFAR10 subset for fast iteration, not a full training
+        # budget -- without this note, the resulting low accuracy (e.g.
+        # ~20% on resnet18) reads as a bug to anyone running this for the
+        # first time rather than the intended fast-demo scope.
+        print(
+            "[QAT] default budget: 512 train / 128 val / 1000 test images, 5 epochs (fast-iteration subset, "
+            "not full training) -- low accuracy (e.g. ~15-30% on CIFAR10) at this scale is expected, not a bug. "
+            "AUTOCIM_QAT_TRAIN_SIZE=full and a larger AUTOCIM_QAT_TEST_SIZE widen the dataset for a more realistic number."
+        )
         resumable_input = build_initial_state(
             model_id, hw_config, target_accuracy, target_energy_pj, target_latency_ms, allow_approximate_calibration
         )
@@ -1428,7 +1521,7 @@ def run_session(
         if learned_calibration:
             resumable_input["calibration_factors"] = merge_dicts(resumable_input["calibration_factors"], learned_calibration)
             print(f"[long-term] 이전 실행에서 학습된 보정계수를 불러왔습니다: hw_spec_id={hw_config.hw_spec_id!r}")
-        learned_solutions = model_store.get_pareto_solutions(model_id)
+        learned_solutions = model_store.get_pareto_solutions(_pareto_store_key(model_id, hw_config.hw_spec_id))
         if learned_solutions and learned_solutions.get("candidates"):
             resumable_input["candidate_history"] = list(learned_solutions["candidates"])
             print(
@@ -1440,18 +1533,59 @@ def run_session(
             f"[calibration] {_describe_calibration_status(resumable_input['calibration_provenance'], hw_config.hw_spec_id)}"
         )
 
-        if parallel_warmup_workers is not None:
-            # Fresh session only -- a resumed/paused session already has
-            # whatever candidate_history it persisted, and this step's
-            # whole point is seeding history *before* the first real
-            # iteration (tools/batch_warmup.py's module docstring).
-            print(f"Evaluating LHS warm-up candidates across up to {parallel_warmup_workers} worker(s)...")
+        # Fresh session only -- a resumed/paused session already has
+        # whatever candidate_history it persisted, and this step's whole
+        # point is seeding history *before* the first real iteration
+        # (tools/batch_warmup.py's module docstring). Always runs (not
+        # opt-in): every LHS warm-up candidate is evaluated up front, all
+        # at once, so warm-up never stops for a HITL prompt -- MAX_RETRY_LIMIT
+        # (nodes/evaluator.py) is graph-loop state that this batch path
+        # never touches. `parallel_warmup_workers` (--parallel-warmup-workers)
+        # only overrides how many threads to use; omitting it still runs
+        # every warm-up candidate, just with run_parallel_warmup's own
+        # min(n_warmup, cpu_count) default.
+        #
+        # Skipped when learned_solutions already seeded candidate_history
+        # above: that's this same "warm-up needs fewer (or zero) new LHS
+        # samples" case the seeding comment describes, and unconditionally
+        # overwriting resumable_input["candidate_history"] here would throw
+        # the just-loaded stored Pareto front away.
+        if resumable_input["candidate_history"]:
+            print(
+                f"[long-term] 이미 학습된 후보 {len(resumable_input['candidate_history'])}개가 있어 "
+                "LHS warm-up 배치를 건너뜁니다."
+            )
+        else:
+            # A single CUDA device has no safe way to run concurrent QAT
+            # trials from separate Python threads -- cudnn/the CUDA driver
+            # context is not built for that, and it surfaces as crashes
+            # (e.g. "CUDA error: invalid resource handle" from a BatchNorm
+            # forward call), not just the slower OOM-under-contention case
+            # this module's docstring already warned about. Defaulting to
+            # 1 worker there keeps this step safe out of the box; an
+            # explicit --parallel-warmup-workers still overrides it (the
+            # user is opting into that risk knowingly).
+            effective_max_workers = parallel_warmup_workers
+            if effective_max_workers is None and _resolve_device().type == "cuda":
+                effective_max_workers = 1
+            worker_desc = f"up to {effective_max_workers} worker(s)" if effective_max_workers is not None else "the default worker count"
+            print(f"Evaluating LHS warm-up candidates across {worker_desc}...")
+
+            def _print_warmup_progress(done: int, total: int) -> None:
+                # \r + no trailing newline: updates the same line in place
+                # instead of printing a new one per candidate -- each real
+                # QAT trial can take minutes, and without this the whole
+                # batch prints nothing at all until it's entirely done,
+                # which reads as a hang rather than real progress.
+                print(f"\r  warm-up: {done}/{total} candidate(s) evaluated...", end="", flush=True)
+
             try:
-                warmup_candidates, warmup_failures = run_parallel_warmup(
+                warmup_candidates, warmup_failures, warmup_decisions = run_parallel_warmup(
                     model_id,
                     hw_config,
                     calibration_factors=resumable_input["calibration_factors"],
-                    max_workers=parallel_warmup_workers,
+                    max_workers=effective_max_workers,
+                    on_progress=_print_warmup_progress,
                 )
             except KeyboardInterrupt:
                 # Nothing persisted yet at this point (warm-up runs before
@@ -1459,11 +1593,28 @@ def run_session(
                 # --thread-id state to resume, this run is simply gone.
                 print("\n\n중단되었습니다 (warm-up 단계라 저장된 진행 상황이 없습니다).")
                 return
+            print()  # newline after the in-place \r progress line above
             resumable_input["candidate_history"] = warmup_candidates
             resumable_input["failure_history"] = warmup_failures
+            # tools/batch_warmup.py's own planner_decisions-shaped entries
+            # (search_tag="LHS warm-up candidate i/n", no real LLM call) --
+            # without these, tools/dashboard.py's "search phase"/"rationale"
+            # columns render as a bare "-" for every warm-up candidate, since
+            # its _iteration_rows join has nothing at these iteration numbers
+            # otherwise (only real planner_node calls write planner_decisions).
+            resumable_input["planner_decisions"] = warmup_decisions
+            # candidate_history/failure_history entries are numbered
+            # 1..len(warmup_candidates) (run_parallel_warmup's own
+            # warmup_index + 1) -- without this, the sequential graph loop's
+            # first planner_node call would compute iteration_count = 0 + 1
+            # and re-issue iteration 1, colliding with a warm-up candidate
+            # that already used that number and mislabeling every iteration
+            # after it in the printed log/dashboard.
+            resumable_input["iteration_count"] = len(warmup_candidates)
             print(
-                f"Parallel warm-up done: {len(warmup_candidates)} candidate(s) recorded, "
-                f"{len(warmup_failures)} failure(s)."
+                f"Parallel warm-up done: {len(warmup_candidates)} candidate(s) recorded as "
+                f"iteration 1-{len(warmup_candidates)} ({len(warmup_failures)} failure(s)). "
+                f"Sequential search continues from iteration {len(warmup_candidates) + 1}."
             )
 
     while True:
@@ -1593,7 +1744,13 @@ def main() -> None:
             target_accuracy=target_accuracy,
             target_energy_pj=target_energy_pj,
             target_latency_ms=target_latency_ms,
-            allow_approximate_calibration=args.allow_approximate_calibration or allow_approximate_from_prompt,
+            # Wizard mode: the user's own interactive y/n answer (default
+            # "yes", see _prompt_approx_calibration) governs. Scripted mode
+            # (--hw-config given, no wizard): approximate calibration is the
+            # default, opted back out of via --exact-calibration-only.
+            allow_approximate_calibration=(
+                allow_approximate_from_prompt if used_wizard else not args.exact_calibration_only
+            ),
             auto_hitl=args.auto_hitl,
             auto_hitl_max_rounds=args.auto_hitl_max_rounds,
         )
