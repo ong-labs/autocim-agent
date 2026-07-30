@@ -31,6 +31,17 @@ figure, not just an opaque multiplier. Empty for any `hw_spec_id` that
 stayed uncalibrated (factor 1.0), same honesty rule as
 `calibration_factors` itself.
 
+`search_bound_overrides` accumulates every `human_overrides`/HITL `new_bounds`
+a researcher has approved so far this session (nodes/planner.py merges each
+newly-consumed `human_overrides` into it via the same `merge_dicts` reducer).
+Unlike `human_overrides` itself -- which nodes/planner.py clears the same
+step it reads it (checklist item 3 / CLAUDE.md 5.A), so the same HITL
+interrupt doesn't re-fire forever -- the *bounds* a researcher already
+approved keep constraining every later candidate's `search_bounds()` for the
+rest of the run, not just the one candidate right after approval. A later
+HITL round narrowing the same key (e.g. tightening `pruning_ratio_max`
+again) overwrites that key's earlier value; other keys are untouched.
+
 `target_accuracy`/`target_energy_pj`/`target_latency_ms` are optional,
 run-wide multi-objective goals (nodes/evaluator.py: a candidate must meet
 every *configured* one, in addition to @verifier's own IR-drop/noise
@@ -44,6 +55,15 @@ a run early -- these fields are the fix for that gap, not a new feature
 invented speculatively (Research_Plan.md's own evaluator_node sketch names
 "Target 지표 미달성" as a failure reason, implying an accuracy/energy/latency
 target was always part of the intended design, just never implemented).
+
+`planner_flagged_anomaly` is @planner's LLM-set early-warning signal
+(schemas/planner.py's `PlannerLayerDecision.anomaly_note`) -- unlike
+`human_overrides`, this needs no explicit reset: @planner sets it fresh
+every iteration (`None` when nothing was flagged that iteration), so a
+stale flag never leaks into a later one. @evaluator ORs it into
+`needs_hitl` alongside the usual `retry_count >= MAX_RETRY_LIMIT` check,
+so a researcher can be pulled in immediately on something the LLM finds
+concerning, not only after 3 routine misses.
 """
 
 import operator
@@ -90,7 +110,9 @@ class AutoCIMState(TypedDict):
     calibration_factors: Annotated[Dict[str, float], merge_dicts]
     calibration_provenance: Annotated[Dict[str, Dict[str, Any]], merge_dicts]
     human_overrides: Dict[str, Any]
+    search_bound_overrides: Annotated[Dict[str, Any], merge_dicts]
     planned_layer_configs: List[Dict[str, Any]]
+    planner_flagged_anomaly: Optional[str]
     model_id: str
     hw_spec_id: str
     target_accuracy: Optional[float]
