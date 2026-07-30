@@ -59,7 +59,9 @@ def make_state(**overrides: Any) -> AutoCIMState:
         "calibration_factors": {},
         "calibration_provenance": {},
         "human_overrides": {},
+        "search_bound_overrides": {},
         "planned_layer_configs": [],
+        "planner_flagged_anomaly": None,
         "model_id": "resnet18",
         "hw_spec_id": GOOD_HW_SPEC_ID,
         "target_accuracy": None,
@@ -146,16 +148,14 @@ class FakeToolCallingChatModel:
     """
 
     def __init__(self, tool_call_args: Optional[Dict[str, Any]] = None):
-        # Two distinct per-stage entries (matching FAKE_LAYER_GROUPS below's
-        # "conv"/"fc" stage names) so tests can verify real per-stage
-        # differentiation actually flows through the whole pipeline, not
-        # just a single flat entry applied uniformly.
+        # PlannerLayerDecision no longer has a layer_configs field (nodes/
+        # planner.py's module docstring: the search decides stage_configs,
+        # the LLM only explains it) -- this canned response only needs
+        # rationale/rationale_ko/anomaly_note.
         self._tool_call_args = tool_call_args or {
-            "layer_configs": [
-                {"layer_name": "conv", "weight_bits": 6, "activation_bits": 6, "column_pruning_ratio": 0.1},
-                {"layer_name": "fc", "weight_bits": 4, "activation_bits": 4, "column_pruning_ratio": 0.2},
-            ],
             "rationale": "fake planner decision for testing",
+            "rationale_ko": "테스트용 가짜 planner 결정",
+            "anomaly_note": None,
         }
         self.bind_tools_calls: List[Dict[str, Any]] = []
         self.invoke_calls: List[Any] = []
