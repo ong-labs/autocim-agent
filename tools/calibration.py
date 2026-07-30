@@ -217,44 +217,54 @@ KNOWN_REFERENCES: List[CalibrationReference] = [
         crossbar_rows=64,
         crossbar_cols=64,
         adc_bits=4,
-        weight_bits=4,
-        # Dong, Sinangil et al. 2020 (ISSCC 15.3, TSMC): silicon-measured,
-        # 7nm FinFET, a genuine "4b Flash ADC" (explicit in the text --
-        # "column-wise Flash ADCs", "Each 4b Flash ADC consists of 15 SAs")
-        # -- matches this codebase's flash-ADC energy assumption more
-        # directly than any reference above. "351 TOPS/W" is the paper's
-        # headline efficiency; cross-checked its own MAC-to-op convention
-        # via throughput/cycle-time rather than assuming: 372.4 GOPS x 5.5ns
-        # cycle time = 2048 ops/cycle, and the macro does 1024 MAVs/cycle
-        # (64 inputs x 16 weights) -- so this paper also counts 1 MAC == 2
-        # ops (same convention as the Correll 2025 reference above, verified
-        # independently here rather than assumed). 2 / 351e12 J/MAC ~=
-        # 0.0057 pJ/MAC. (The paper separately reports a 7.8pJ *maximum*
-        # energy per cycle -- deliberately not used, since that is the
-        # worst-case all-1s pattern, not what the 351TOPS/W average-case
-        # headline efficiency reflects.)
-        reference_energy_pj_per_mac=0.0057,
+        weight_bits=1,
+        # Garg, Jia, Phadke & Yu 2026 (IEEE Solid-State Circuits Letters):
+        # silicon-measured, 28nm GlobalFoundries HKMG, a genuine FeFET
+        # (ferroelectric FET) crossbar -- the first non-RRAM/SRAM/MRAM
+        # device technology in this list (every reference above is RRAM,
+        # SRAM, or a DARAM/MRAM variant). "Eight 4-bit Flash ADCs" (explicit
+        # in the abstract) matches this codebase's flash-ADC energy
+        # assumption directly, same as the Dong/Sinangil reference this one
+        # replaces below. "Energy efficiency of 346.6 TOPS/W for 1x1b MAC"
+        # is this work's reported figure at its native 1-bit weight/1-bit
+        # input operating point; as with the NeuroSim/DARAM/MRAM references
+        # above, the paper does not state whether its TOPS convention counts
+        # 1 MAC as 1 or 2 ops -- assumed 1 MAC == 1 op here, consistent with
+        # this project's practice of stating that assumption rather than
+        # silently absorbing it. 1/346.6e12 J/MAC ~= 0.00289 pJ/MAC.
+        #
+        # This entry occupies the same (64, 64, 4-bit-ADC) key as the
+        # Dong/Sinangil 2020 SRAM reference that used to be here --
+        # find_matching_reference() only keys on (crossbar_rows,
+        # crossbar_cols, adc_bits), which has no field for device
+        # technology or weight_bits (HWConfig itself doesn't model either),
+        # so the two references could not coexist without a schema change.
+        # Replaced deliberately: this project's KNOWN_REFERENCES had zero
+        # FeFET data points despite RRAM/SRAM/MRAM/DARAM all being
+        # represented, so the device-technology diversity gained here was
+        # judged more valuable than keeping the 7nm SRAM data point. See
+        # git history for the displaced Dong/Sinangil entry's full citation.
+        reference_energy_pj_per_mac=0.00289,
         source=(
-            "Dong, Sinangil, Erbagci, Sun, Khwa, Liao, Wang & Chang, 'A "
-            "351TOPS/W and 372.4GOPS Compute-in-Memory SRAM Macro in 7nm "
-            "FinFET CMOS for Machine-Learning Applications' (ISSCC 2020, "
-            "Session 15.3, pp. 242-243) -- '64x64 8T macro is fabricated "
-            "in 7nm FinFET technology... Energy efficiency is 351 TOPS/W "
-            "and throughput is 372.4 GOPS for 1024 (64x16) 4x4b MAV "
-            "operations'"
+            "Garg, Jia, Phadke & Yu, 'A 28-nm FeFET Compute-in-Memory Macro "
+            "With 64x64 Array Size and On-Chip 4-Bit Flash ADC' (IEEE "
+            "Solid-State Circuits Letters, vol. 9, pp. 13-16, 2026) -- "
+            "'a 4-kb FeFET-CIM macro fabricated in the GlobalFoundries "
+            "28-nm high-k metal gate (HKMG) process... a 64x64 FeFET array "
+            "with peripheral circuits for program, erase, and current-mode "
+            "CIM operations and eight 4-bit Flash ADCs' and 'an energy "
+            "efficiency of 346.6 TOPS/W for 1x1b MAC'"
         ),
         note=(
-            "weight_bits=4 ('4b weight is realized by charge sharing among "
-            "binary-weighted computation caps'), input is also 4b (via RWL "
-            "pulse count). MAV = 'multiply-and-average', this paper's own "
-            "term for its accumulation operation across 64 inputs -- treated "
-            "as equivalent to a MAC here, same as every other reference in "
-            "this list. Originally sought for a 512x512/8-bit-ADC 'large-"
-            "scale server' target hardware profile; no silicon-measured "
-            "match at that array size/ADC resolution was found, so this "
-            "64x64/4-bit point was substituted as the closest real, "
-            "flash-ADC-based alternative -- a real repositioning, not a "
-            "stand-in for the original spec."
+            "weight_bits=1 is this design's native operating point -- the "
+            "paper's headline 346.6 TOPS/W figure is reported specifically "
+            "'for 1x1b MAC', i.e. 1-bit weight, 1-bit input. The abstract "
+            "separately reports '85.2% [CIFAR10/VGG-8 inference accuracy] "
+            "for 16 row parallel compute with 4-bit ADC resolution' and "
+            "'89.1% with 8 row parallel compute with 3-bit resolution' -- "
+            "those are the paper's own multi-row-parallelism/reduced-ADC "
+            "operating modes, not additional weight-precision data points, "
+            "so they are not added as separate entries here."
         ),
     ),
     CalibrationReference(
