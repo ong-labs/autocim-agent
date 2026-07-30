@@ -7,8 +7,6 @@ sketch names "Target 지표 미달성" as a failure reason, so this closes a rea
 gap between the documented design intent and what was actually implemented.
 """
 
-import pytest
-
 from nodes.evaluator import MAX_RETRY_LIMIT, check_targets, evaluator_node
 from tests.test_evaluator_candidate_history import _metrics
 
