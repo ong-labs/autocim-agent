@@ -12,6 +12,8 @@ from tools.search import (
     latin_hypercube_stage_candidates,
     predict_accuracy,
     predict_accuracy_stages,
+    predict_energy_stages,
+    predict_latency_stages,
     propose_stage_candidates_via_surrogate,
     propose_via_surrogate,
     warmup_candidate,
@@ -143,7 +145,7 @@ def test_warmup_stage_candidate_index_wraps_via_modulo():
     assert a == b
 
 
-# --- Per-stage IDW surrogate + random-search UCB acquisition -----------------
+# --- Per-stage IDW surrogate + NSGA-II multi-objective acquisition ----------
 
 
 def _layer_configs(point):
@@ -172,7 +174,6 @@ def test_predict_accuracy_stages_skips_history_entries_covering_different_stages
     """A history entry from a different model_id (different stage names)
     isn't directly comparable to the current search space -- it must be
     ignored rather than silently mismatched against the wrong stage."""
-    other_model_point = [(4, 0.1), (6, 0.2)]
     history = [
         {
             "layer_configs": [
@@ -188,16 +189,61 @@ def test_predict_accuracy_stages_skips_history_entries_covering_different_stages
     assert uncertainty == 1.0
 
 
-def test_propose_stage_candidates_via_surrogate_favors_high_accuracy_region_under_pure_exploitation():
+def test_predict_energy_stages_exact_match_returns_that_energy_with_no_uncertainty():
+    point = [(4, 0.1), (6, 0.2), (2, 0.0), (8, 0.4)]
+    history = [{"layer_configs": _layer_configs(point), "energy_pj": 42.5}]
+    predicted, uncertainty = predict_energy_stages(point, history, STAGE_NAMES, BIT_BOUNDS, PRUNING_BOUNDS)
+    assert predicted == 42.5
+    assert uncertainty == 0.0
+
+
+def test_predict_energy_stages_with_no_history_is_zero_and_maximally_uncertain():
+    """Unlike accuracy's 0.5 neutral default (a natural midpoint on
+    [0, 1]), energy_pj/noc_latency_ms have no natural bounded range --
+    0.0 is the documented neutral value, distinguishing this from
+    predict_accuracy_stages's default."""
+    point = [(4, 0.1)] * len(STAGE_NAMES)
+    predicted, uncertainty = predict_energy_stages(point, [], STAGE_NAMES, BIT_BOUNDS, PRUNING_BOUNDS)
+    assert predicted == 0.0
+    assert uncertainty == 1.0
+
+
+def test_predict_latency_stages_exact_match_returns_that_latency_with_no_uncertainty():
+    point = [(4, 0.1), (6, 0.2), (2, 0.0), (8, 0.4)]
+    history = [{"layer_configs": _layer_configs(point), "noc_latency_ms": 1.75}]
+    predicted, uncertainty = predict_latency_stages(point, history, STAGE_NAMES, BIT_BOUNDS, PRUNING_BOUNDS)
+    assert predicted == 1.75
+    assert uncertainty == 0.0
+
+
+def test_predict_stage_value_skips_entries_missing_that_objectives_key():
+    """A candidate_history entry missing energy_pj (e.g. @tuner failed
+    before @profiler ran) must not crash the energy surrogate -- it's
+    simply excluded from that objective's fit, same treatment as a
+    stage-name mismatch."""
+    point = [(4, 0.1)] * len(STAGE_NAMES)
+    history = [{"layer_configs": _layer_configs(point), "accuracy": 0.9}]  # no energy_pj key
+    predicted, uncertainty = predict_energy_stages(point, history, STAGE_NAMES, BIT_BOUNDS, PRUNING_BOUNDS)
+    assert predicted == 0.0  # neutral, exactly as if history were empty
+    assert uncertainty == 1.0
+
+
+def test_propose_stage_candidates_via_surrogate_favors_the_dominant_region_under_pure_exploitation():
+    """Genuinely multi-objective now: `good_point` dominates `bad_point` on
+    all three objectives (higher accuracy, lower energy, lower latency),
+    so under pure exploitation (exploration_weight=0.0) every point NSGA-II
+    finds on the surrogate's Pareto front should cluster near it -- not
+    just accuracy, which is all the pre-NSGA-II single-objective UCB scan
+    ever modeled (the real production gap this rewrite fixes)."""
     good_point = [(6.0, 0.05)] * len(STAGE_NAMES)
     bad_point = [(2.0, 0.45)] * len(STAGE_NAMES)
     history = [
-        {"layer_configs": _layer_configs(good_point), "accuracy": 0.9},
-        {"layer_configs": _layer_configs(bad_point), "accuracy": 0.1},
+        {"layer_configs": _layer_configs(good_point), "accuracy": 0.9, "energy_pj": 40.0, "noc_latency_ms": 1.0},
+        {"layer_configs": _layer_configs(bad_point), "accuracy": 0.1, "energy_pj": 200.0, "noc_latency_ms": 8.0},
     ]
 
     proposed = propose_stage_candidates_via_surrogate(
-        history, STAGE_NAMES, BIT_BOUNDS, PRUNING_BOUNDS, seed=42, n_candidates=200, exploration_weight=0.0
+        history, STAGE_NAMES, BIT_BOUNDS, PRUNING_BOUNDS, seed=42, n_candidates=100, exploration_weight=0.0
     )
 
     def dist(a, b):
@@ -207,10 +253,55 @@ def test_propose_stage_candidates_via_surrogate_favors_high_accuracy_region_unde
 
 
 def test_propose_stage_candidates_via_surrogate_deterministic_for_same_seed():
-    history = [{"layer_configs": _layer_configs([(6.0, 0.05)] * len(STAGE_NAMES)), "accuracy": 0.9}]
+    history = [
+        {"layer_configs": _layer_configs([(6.0, 0.05)] * len(STAGE_NAMES)), "accuracy": 0.9, "energy_pj": 40.0, "noc_latency_ms": 1.0}
+    ]
     a = propose_stage_candidates_via_surrogate(history, STAGE_NAMES, BIT_BOUNDS, PRUNING_BOUNDS, seed=42)
     b = propose_stage_candidates_via_surrogate(history, STAGE_NAMES, BIT_BOUNDS, PRUNING_BOUNDS, seed=42)
     assert a == b
+
+
+def test_propose_stage_candidates_via_surrogate_considers_energy_and_latency_not_just_accuracy():
+    """The core regression this rewrite fixes: with two history points that
+    trade off accuracy against energy/latency (neither dominates the
+    other), the proposed candidate must not just chase the highest-accuracy
+    point while ignoring energy/latency entirely -- it should land nearer
+    the lower-energy/lower-latency point than pure accuracy-only search
+    would, since energy_pj/noc_latency_ms are now real objectives too."""
+    high_accuracy_expensive = [(7.0, 0.0)] * len(STAGE_NAMES)
+    lower_accuracy_cheap = [(3.0, 0.3)] * len(STAGE_NAMES)
+    history = [
+        {
+            "layer_configs": _layer_configs(high_accuracy_expensive),
+            "accuracy": 0.9,
+            "energy_pj": 300.0,
+            "noc_latency_ms": 10.0,
+        },
+        {
+            "layer_configs": _layer_configs(lower_accuracy_cheap),
+            "accuracy": 0.6,
+            "energy_pj": 30.0,
+            "noc_latency_ms": 1.0,
+        },
+    ]
+
+    # Pure exploitation, weighted purely toward accuracy under the OLD
+    # single-objective surrogate would always land near high_accuracy_expensive.
+    # Under genuine multi-objective NSGA-II, the returned Pareto-optimal set
+    # should include points nearer the cheap/low-latency end too -- assert
+    # that at least one of several seeded picks lands closer to the cheap
+    # point than to the expensive one, proving energy/latency actually
+    # shape the search instead of being invisible to it.
+    def dist(a, b):
+        return math.sqrt(sum((a[i][0] - b[i][0]) ** 2 + (a[i][1] - b[i][1]) ** 2 for i in range(len(a))))
+
+    proposals = [
+        propose_stage_candidates_via_surrogate(
+            history, STAGE_NAMES, BIT_BOUNDS, PRUNING_BOUNDS, seed=s, n_candidates=100, exploration_weight=0.0
+        )
+        for s in range(5)
+    ]
+    assert any(dist(p, lower_accuracy_cheap) < dist(p, high_accuracy_expensive) for p in proposals)
 
 
 # --- Real Pareto rank (NSGA-II-style, computed online) ----------------------
