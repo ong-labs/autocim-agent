@@ -1,5 +1,7 @@
 # [연구 계획서 / Research Plan]
 
+> **이 문서는 프로젝트 초기 기획서입니다.** 구현이 진행되며 실제 아키텍처/알고리즘이 아래 내용과 달라진 부분이 있습니다 (예: `@precision_verifier` 노드 부재, "정규화 다중 목적 탐색" 서술이 실제 NSGA-II 리라이트 이전 상태). **현재 실제 구현을 반영한 아키텍처/설계 근거는 [`../README.md`](../README.md)를 기준으로 삼으세요.** 이 문서는 프로젝트의 최초 문제의식과 목표를 기록해두기 위해 그대로 남겨둡니다.
+
 ## AutoCIM-Agent: CIM 및 온디바이스 AI 환경을 위한 하드웨어 인지형 자율 멀티에이전트 모델 최적화 프레임워크
 
 **AutoCIM-Agent: A CIM-Aware Autonomous Multi-Agent Framework for On-Device AI Model Optimization**
