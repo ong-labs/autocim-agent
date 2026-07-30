@@ -57,6 +57,64 @@ def test_planner_treats_empty_dict_override_as_no_override(state_factory):
     assert "needs_hitl" not in update
 
 
+def test_search_bound_overrides_persist_across_iterations_after_hitl(state_factory, registered_hw_config):
+    """Regression: an approved HITL override must keep constraining every
+    later candidate's search_bounds()/_clamp_layer_configs() for the rest of
+    the run, not just the one candidate right after approval -- otherwise
+    the same convergence failure (and the same HITL suggestion) recurs every
+    MAX_RETRY_LIMIT iterations forever.
+
+    weight_bits_min=3 is deliberately within registered_hw_config's own
+    ceiling (adc_bits=8/dac_bits=4 -> bits_max=4), so this only exercises
+    persistence, not the separate hw-ceiling-clamp behavior covered by
+    test_hitl_override_cannot_push_weight_bits_past_the_hw_ceiling below."""
+    state = state_factory(
+        hw_spec_id=registered_hw_config.hw_spec_id,
+        iteration_count=3,
+        human_overrides={"weight_bits_min": 3},
+        needs_hitl=True,
+        retry_count=3,
+    )
+
+    update = planner_node(state)
+    assert update["search_bound_overrides"] == {"weight_bits_min": 3}
+
+    # Next iteration: human_overrides is back to {} (as hitl_node/planner
+    # leave it after consumption), but search_bound_overrides carries
+    # forward -- simulate the same merge LangGraph's reducer performs.
+    state = {**state, **update}
+    state["human_overrides"] = {}
+
+    update2 = planner_node(state)
+
+    assert "search_bound_overrides" not in update2  # nothing new to persist
+    for layer_config in update2["planned_layer_configs"]:
+        assert layer_config["weight_bits"] >= 3
+
+
+def test_hitl_override_cannot_push_weight_bits_past_the_hw_ceiling(state_factory, registered_hw_config):
+    """Regression: a researcher's weight_bits_min override must be capped at
+    hw_spec_id's own ceiling (min(adc_bits, dac_bits)), not forced through
+    as-is -- neither @tuner (tools/simulators.py) nor the physics it calls
+    (tools/cim_physics.py) validates weight_bits against dac_bits/adc_bits,
+    so a raw pass-through here would silently simulate energy/accuracy for
+    a crossbar configuration the hardware can't physically support (observed
+    live: dac_bits=4 but a weight_bits_min=8 override still landed as
+    weight_bits=8 in planned_layer_configs before this fix)."""
+    state = state_factory(
+        hw_spec_id=registered_hw_config.hw_spec_id,  # adc_bits=8, dac_bits=4 -> ceiling 4
+        iteration_count=3,
+        human_overrides={"weight_bits_min": 8},
+        needs_hitl=True,
+        retry_count=3,
+    )
+
+    update = planner_node(state)
+
+    for layer_config in update["planned_layer_configs"]:
+        assert layer_config["weight_bits"] <= 4
+
+
 def test_retry_count_accumulates_across_replan_loops_until_needs_hitl(state_factory):
     """Regression guard: planner<->evaluator loops with no override must let
     retry_count climb every iteration until MAX_RETRY_LIMIT, not get reset
