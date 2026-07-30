@@ -41,7 +41,7 @@ def test_render_dashboard_html_with_no_candidates_yet(state_factory):
     output = render_dashboard_html(state)
 
     assert "No evaluated candidates yet." in output
-    assert "n/a (no AUTOCIM_LLM_COST_PER_1K_* configured)" in output
+    assert "0 node-invocation(s)" in output
 
 
 def test_render_dashboard_html_joins_candidate_history_and_planner_decisions_by_iteration(state_factory):
@@ -65,7 +65,10 @@ def test_render_dashboard_html_includes_pareto_chart_points_per_iteration(state_
     assert output.count("<circle") == 2  # one point per evaluated candidate
 
 
-def test_render_dashboard_html_reports_estimated_llm_cost_when_configured(state_factory):
+def test_render_dashboard_html_reports_llm_call_counts(state_factory):
+    """No cost figure is shown -- this project targets local LLMs, where
+    there's no per-call billing to estimate (AUTOCIM_LLM_COST_PER_1K_* is
+    for the rare paid-API case and isn't surfaced on the dashboard)."""
     usage = [
         {"node": "planner", "iteration": 1, "attempts": 1, "succeeded": True, "estimated_cost_usd": 0.02},
         {"node": "planner", "iteration": 2, "attempts": 2, "succeeded": False, "estimated_cost_usd": None},
@@ -74,9 +77,53 @@ def test_render_dashboard_html_reports_estimated_llm_cost_when_configured(state_
 
     output = render_dashboard_html(state)
 
-    assert "$0.0200" in output
     assert "2 node-invocation(s)" in output
     assert "1 failed after retries" in output
+    assert "$0.0200" not in output
+    assert "estimated cost" not in output.lower()
+
+
+def test_render_dashboard_html_collapses_a_multi_row_warmup_batch(state_factory):
+    """3+ consecutive "LHS warm-up candidate" rows (tools/batch_warmup.py's
+    parallel path seeds one such planner_decisions entry per candidate --
+    see nodes/planner.py/tools/batch_warmup.py) must render as one
+    collapsed <details> summary row instead of N individual <tr>s, so a
+    real run's up to 12 warm-up candidates don't dominate the table before
+    the surrogate-guided search even starts. The individual candidates
+    must still be present in the HTML (inside the collapsed block), just
+    not as top-level rows."""
+    warmup_decisions = [
+        {
+            "iteration": i,
+            "search_tag": f"LHS warm-up candidate {i}/3",
+            "used_llm": False,
+            "rationale": f"warmup rationale {i}",
+        }
+        for i in (1, 2, 3)
+    ]
+    warmup_candidates = [
+        {
+            "iteration": i,
+            "avg_weight_bits": 4,
+            "avg_column_pruning_ratio": 0.1,
+            "accuracy": 0.1 * i,
+            "energy_pj": 5.0,
+            "noc_latency_ms": 1.0,
+            "is_converged": False,
+            "pareto_rank": 1,
+        }
+        for i in (1, 2, 3)
+    ]
+    state = state_factory(candidate_history=warmup_candidates, planner_decisions=warmup_decisions)
+
+    output = render_dashboard_html(state)
+
+    assert 'class="warmup-details"' in output
+    assert "Warm-up batch (iterations 1-3, 3 candidates" in output
+    for i in (1, 2, 3):
+        assert f"warmup rationale {i}" in output
+    # Collapsed, not rendered as three separate top-level rows.
+    assert output.count('<tr class="warmup-group-row">') == 1
 
 
 def test_render_dashboard_html_handles_a_candidate_with_no_matching_planner_decision(state_factory):
@@ -120,6 +167,32 @@ def test_calibration_section_shows_factor_and_citation_when_calibrated(state_fac
     assert "1.2345x" in output
     assert "Peng et al., NeuroSim V1.5" in output
     assert "assumes 1 MAC == 1 op" in output
+    assert '<p class="calib-warning">' not in output
+
+
+def test_calibration_section_shows_precision_verified_status_distinctly_from_a_literature_match(state_factory):
+    """nodes/precision_verifier.py's own calibration_provenance update
+    (`"precision_verified": True`) must render as calibrated, but must never
+    be confused with a real published-reference match (previous test) --
+    it's a Mock First (CLAUDE.md 5.D) placeholder re-check, not a citation."""
+    state = state_factory(
+        hw_spec_id="precision_checked_hw",
+        calibration_factors={"precision_checked_hw": 1.05},
+        calibration_provenance={
+            "precision_checked_hw": {
+                "precision_verified": True,
+                "raw_energy_pj": 10.0,
+                "precise_energy_pj": 10.5,
+                "iteration": 4,
+            }
+        },
+    )
+
+    output = render_dashboard_html(state)
+
+    assert '<p class="calib-ok">' in output
+    assert "1.0500x" in output
+    assert "precision" in output.lower()
     assert '<p class="calib-warning">' not in output
 
 
