@@ -15,7 +15,6 @@ main() itself exercises.
 
 import argparse
 import json
-import sys
 from datetime import datetime
 
 import pytest
@@ -599,6 +598,7 @@ def _hitl_payload(
     current_energy_pj=None,
     target_latency_ms=None,
     current_latency_ms=None,
+    search_bound_overrides=None,
 ):
     return {
         "reason": "Convergence stalled -- researcher review requested",
@@ -619,6 +619,7 @@ def _hitl_payload(
         "target_accuracy": target_accuracy,
         "target_energy_pj": target_energy_pj,
         "target_latency_ms": target_latency_ms,
+        "search_bound_overrides": search_bound_overrides,
     }
 
 
@@ -698,30 +699,38 @@ def test_suggest_override_bounds_small_gap_uses_tier_0_step(registered_hw_config
 
 
 def test_suggest_override_bounds_medium_gap_uses_tier_1_step(registered_hw_config):
-    # (0.7 - 0.5) / 0.7 ~= 29% -- in the 15-40% tier-1 band.
+    # (0.7 - 0.5) / 0.7 ~= 29% -- in the 15-40% tier-1 band. Naive step
+    # (2 + step(2) = 4) lands exactly on this hw_spec's ceiling (adc_bits=8,
+    # dac_bits=4 -> 4) -- pulled back by _MIN_BITS_SEARCH_MARGIN(1) so
+    # weight_bits_min..bits_ceiling isn't pinned to a single value.
     payload = _hitl_payload(
         avg_bits=2, hw_spec_id=registered_hw_config.hw_spec_id, target_accuracy=0.7, current_accuracy=0.5
     )
-    assert main.suggest_override_bounds(payload)["weight_bits_min"] == 4  # 2 + step(2)
+    assert main.suggest_override_bounds(payload)["weight_bits_min"] == 3  # 4, pulled back 1 from the ceiling
 
 
 def test_suggest_override_bounds_large_gap_uses_tier_2_step_capped_at_hw_ceiling(registered_hw_config):
     # (0.7 - 0.1) / 0.7 ~= 86% -- well past the 40% tier-2 threshold, so the
     # naive suggestion (avg_bits 4 + step(3) = 7) would exceed this
-    # hw_spec's real ceiling (adc_bits=8, dac_bits=4 -> min(8,8,4) = 4) --
-    # must be clamped there, not proposed above what the search itself
-    # would ever be allowed to try.
+    # hw_spec's real ceiling (adc_bits=8, dac_bits=4 -> min(8,8,4) = 4).
+    # Capping it at the ceiling exactly would pin weight_bits to a single
+    # value (weight_bits_max is untouched, still == ceiling) -- must land
+    # one below it (_MIN_BITS_SEARCH_MARGIN) so there's still a real
+    # weight_bits range left for the search to explore.
     payload = _hitl_payload(
         avg_bits=4, hw_spec_id=registered_hw_config.hw_spec_id, target_accuracy=0.7, current_accuracy=0.1
     )
-    assert main.suggest_override_bounds(payload)["weight_bits_min"] == 4  # capped, not 7
+    assert main.suggest_override_bounds(payload)["weight_bits_min"] == 3  # ceiling(4) - margin(1), not 7 or 4
 
 
 def test_suggest_override_bounds_compression_direction_also_escalates_and_caps(registered_hw_config):
     # energy_pj 4000 vs target 2000 -- a 100% overshoot, tier-2 -> step(3)
     # for weight_bits_max, but never below nodes/planner.py's own search
     # floor (else the override would invert the range and get silently
-    # ignored downstream).
+    # ignored downstream) -- and, mirroring the wants_precision case, never
+    # exactly AT that floor either, since weight_bits_min is untouched and
+    # still == floor: that would pin weight_bits to a single value the same
+    # way an unclamped tier-2 step pinned it at the ceiling in production.
     payload = _hitl_payload(
         reason="energy_pj 4000.0 above target 2000.0",
         avg_bits=3,
@@ -730,7 +739,50 @@ def test_suggest_override_bounds_compression_direction_also_escalates_and_caps(r
         current_energy_pj=4000.0,
     )
     result = main.suggest_override_bounds(payload)
-    assert result["weight_bits_max"] == 2  # floor (nodes/planner.py's _WEIGHT_BITS_MIN), not 0
+    assert result["weight_bits_max"] == 3  # floor(2) + margin(1), not 0 and not exactly the floor
+
+
+def test_suggest_override_bounds_never_collapses_weight_bits_or_pruning_to_a_single_value(registered_hw_config):
+    """Reproduces a real production stall: a >=40% accuracy miss (tier-2)
+    on this hw_spec (dac_bits=4 -> weight_bits ceiling 4) suggested
+    weight_bits_min=4 and pruning_ratio_max=0.0 -- both exactly pinning the
+    untouched other end of their range (weight_bits_max was already 4,
+    pruning_ratio_min was already 0.0). Every later surrogate-model
+    proposal was then forced identical (nodes/planner.py has nothing left
+    to search), and 3 more real QAT trials of the same config (varying only
+    by training's own randomness) burned real time before HITL fired
+    again. The suggestion must always leave a searchable range."""
+    payload = _hitl_payload(
+        avg_bits=3.3,
+        avg_pruning=0.13083,
+        hw_spec_id=registered_hw_config.hw_spec_id,
+        target_accuracy=0.8,
+        current_accuracy=0.436,
+    )
+    result = main.suggest_override_bounds(payload)
+    bit_bounds, pruning_bounds = main.search_bounds(registered_hw_config.hw_spec_id)
+    assert result["weight_bits_min"] < bit_bounds[1]  # strictly below the untouched weight_bits_max
+    assert result["pruning_ratio_max"] > pruning_bounds[0]  # strictly above the untouched pruning_ratio_min
+
+
+def test_suggest_override_bounds_does_not_regress_an_already_approved_override(registered_hw_config):
+    """Regression: a real run approved weight_bits_min=4 at one HITL round
+    (registered_hw_config's own ceiling: adc_bits=8, dac_bits=4 -> 4), then
+    a LATER HITL round's suggestion silently proposed weight_bits_min=3 --
+    looser than what was already approved -- because suggest_override_bounds
+    computed fresh from the hw's raw ceiling every time, never seeing
+    search_bound_overrides at all (nodes/hitl.py's interrupt payload didn't
+    even carry it). The suggestion must never be looser than what a
+    researcher has already approved earlier this run."""
+    payload = _hitl_payload(
+        avg_bits=3.0,
+        hw_spec_id=registered_hw_config.hw_spec_id,
+        target_accuracy=0.7,
+        current_accuracy=0.3,
+        search_bound_overrides={"weight_bits_min": 4},
+    )
+    result = main.suggest_override_bounds(payload)
+    assert result["weight_bits_min"] >= 4
 
 
 def test_suggest_override_bounds_missing_target_falls_back_to_tier_0(registered_hw_config):
@@ -1067,16 +1119,18 @@ def test_run_session_seeds_candidate_history_from_parallel_warmup(tmp_path, regi
         run_session("resnet18", registered_hw_config, "thread-warmup", checkpointer, parallel_warmup_workers=2)
         final_state = build_graph(checkpointer=checkpointer).get_state(config).values
 
-    # good_hw_config converges on the very first *sequential* iteration
-    # (iteration_count == 1, unaffected by warm-up -- planner_node's own
-    # counter), but candidate_history must contain every parallel warm-up
+    # good_hw_config converges on the very first *sequential* (post-warm-up)
+    # iteration, but candidate_history must contain every parallel warm-up
     # candidate *plus* that one real sequential candidate (the known
     # limitation documented in tools/batch_warmup.py: warm-up doesn't
     # short-circuit early even though one of its own candidates already
-    # converged).
+    # converged). iteration_count continues from the warm-up count (seeded
+    # by run_session) rather than restarting at 1, so it doesn't collide
+    # with a warm-up candidate's own iteration number.
+    n_warmup = warmup_count(n_stages)
     assert final_state["is_converged"] is True
-    assert final_state["iteration_count"] == 1
-    assert len(final_state["candidate_history"]) == warmup_count(n_stages) + 1
+    assert final_state["iteration_count"] == n_warmup + 1
+    assert len(final_state["candidate_history"]) == n_warmup + 1
 
 
 # --- cross-session learning (store.py, wired through run_session) -----------
@@ -1096,10 +1150,14 @@ def test_run_session_persists_pareto_front_and_calibration_on_convergence(monkey
         run_session("resnet18", registered_hw_config, "thread-learn-a", checkpointer)
 
     model_store, hw_store = _long_term_stores(tmp_path)
-    solutions = model_store.get_pareto_solutions("resnet18")
+    solutions = model_store.get_pareto_solutions(main._pareto_store_key("resnet18", registered_hw_config.hw_spec_id))
     assert solutions and len(solutions["candidates"]) >= 1
     assert hw_store.get_calibration_factors(registered_hw_config.hw_spec_id) == {
-        registered_hw_config.hw_spec_id: 1.0  # uncalibrated hw_spec -> @profiler's own default factor
+        # @precision_verifier's mock Stage-2 re-check (tools/precision_check.py)
+        # runs on this run's converged candidate and updates the factor from
+        # @profiler's own uncalibrated default (1.0) to the precise/raw ratio
+        # -- 1.0 + registered_hw_config's device_noise_sigma (0.05) here.
+        registered_hw_config.hw_spec_id: 1.05
     }
 
 
@@ -1120,7 +1178,9 @@ def test_run_session_seeds_candidate_history_from_a_previous_sessions_pareto_fro
         "pareto_rank": 1,
         "iteration": 1,
     }
-    model_store.put_pareto_solutions("resnet18", {"candidates": [stored_candidate]})
+    model_store.put_pareto_solutions(
+        main._pareto_store_key("resnet18", registered_hw_config.hw_spec_id), {"candidates": [stored_candidate]}
+    )
 
     from graph import build_graph
 
@@ -1156,31 +1216,52 @@ def test_run_session_seeds_calibration_factor_from_a_previous_sessions_learning(
 def test_persist_long_term_learnings_never_regresses_the_stored_pareto_front(tmp_path):
     model_store, hw_store = _long_term_stores(tmp_path)
     better = {"accuracy": 0.9, "energy_pj": 50.0, "noc_latency_ms": 0.5}
-    model_store.put_pareto_solutions("resnet18", {"candidates": [better]})
+    model_store.put_pareto_solutions(main._pareto_store_key("resnet18", "some_hw"), {"candidates": [better]})
 
     worse = {"accuracy": 0.5, "energy_pj": 200.0, "noc_latency_ms": 2.0}  # dominated by `better` on every objective
     main._persist_long_term_learnings(
         model_store, hw_store, "resnet18", "some_hw", {"candidate_history": [worse], "calibration_factors": {}}
     )
 
-    solutions = model_store.get_pareto_solutions("resnet18")
+    solutions = model_store.get_pareto_solutions(main._pareto_store_key("resnet18", "some_hw"))
     assert solutions["candidates"] == [better]  # `worse` never made it into the stored front
 
 
-def test_run_session_without_the_flag_keeps_todays_sequential_behavior(tmp_path, registered_hw_config):
-    """Omitting --parallel-warmup-workers must not change anything --
-    candidate_history should accumulate one entry per real graph iteration,
-    exactly as before this feature existed."""
+def test_persist_long_term_learnings_keeps_pareto_fronts_isolated_per_hw_spec_id(tmp_path):
+    # The bug this guards against: a Pareto front measured on one hw_spec_id
+    # (its energy_pj/noc_latency_ms come from that specific HWConfig's
+    # physics) must never be read back as this model's front on a
+    # *different* hw_spec_id -- doing so would mix incomparable objectives
+    # into compute_pareto_rank and desync the new hw's own LHS warm-up index.
+    model_store, hw_store = _long_term_stores(tmp_path)
+    candidate = {"accuracy": 0.9, "energy_pj": 50.0, "noc_latency_ms": 0.5}
+    main._persist_long_term_learnings(
+        model_store, hw_store, "resnet18", "hw_a", {"candidate_history": [candidate], "calibration_factors": {}}
+    )
+
+    assert model_store.get_pareto_solutions(main._pareto_store_key("resnet18", "hw_b")) is None
+    assert model_store.get_pareto_solutions(main._pareto_store_key("resnet18", "hw_a")) == {"candidates": [candidate]}
+
+
+def test_run_session_without_the_flag_still_runs_warmup_batch_by_default(tmp_path, registered_hw_config):
+    """Omitting --parallel-warmup-workers only omits the worker-count
+    override -- the warm-up batch itself always runs (main.py's run_session
+    docstring/comment above the warm-up block), so iteration_count still
+    continues from warmup_count(n_stages), not from 1."""
+    from nodes.planner import real_stage_names, warmup_count
+
+    n_warmup = warmup_count(len(real_stage_names("resnet18")))
     db_path = str(tmp_path / "checkpoints.sqlite")
     with SqliteSaver.from_conn_string(db_path) as checkpointer:
         run_session("resnet18", registered_hw_config, "thread-sequential", checkpointer)
         sessions = list_sessions(checkpointer)
 
     assert sessions[0]["is_converged"] is True
-    assert sessions[0]["iteration_count"] == 1  # good_hw_config converges on the very first real iteration
+    # good_hw_config converges on the first post-warm-up iteration
+    assert sessions[0]["iteration_count"] == n_warmup + 1
 
 
-# --- --allow-approximate-calibration -------------------------------------------
+# --- approximate calibration (default) / --exact-calibration-only (opt-out) ---
 #
 # registered_hw_config (good_hw_config: 128x128, adc_bits=8) has no exact
 # match in tools/calibration.py's KNOWN_REFERENCES -- the one 128x128
@@ -1188,40 +1269,40 @@ def test_run_session_without_the_flag_keeps_todays_sequential_behavior(tmp_path,
 # not something that happens to already be exactly calibrated.
 
 
-def test_build_initial_state_leaves_unmatched_hw_uncalibrated_by_default(registered_hw_config):
+def test_build_initial_state_defaults_to_approximate_calibration_for_unmatched_hw(registered_hw_config):
     state = main.build_initial_state("resnet18", registered_hw_config)
-    assert state["calibration_factors"] == {}
-    assert state["calibration_provenance"] == {}
-
-
-def test_build_initial_state_with_allow_approximate_calibration_seeds_a_factor(registered_hw_config):
-    state = main.build_initial_state("resnet18", registered_hw_config, allow_approximate_calibration=True)
 
     assert registered_hw_config.hw_spec_id in state["calibration_factors"]
     assert state["calibration_factors"][registered_hw_config.hw_spec_id] > 0
     assert state["calibration_provenance"][registered_hw_config.hw_spec_id]["approximate"] is True
 
 
-def test_run_session_prints_uncalibrated_status_by_default(capsys, tmp_path, registered_hw_config):
+def test_build_initial_state_with_exact_calibration_only_leaves_unmatched_hw_uncalibrated(registered_hw_config):
+    state = main.build_initial_state("resnet18", registered_hw_config, allow_approximate_calibration=False)
+    assert state["calibration_factors"] == {}
+    assert state["calibration_provenance"] == {}
+
+
+def test_run_session_prints_approximate_status_by_default(capsys, tmp_path, registered_hw_config):
     db_path = str(tmp_path / "checkpoints.sqlite")
     with SqliteSaver.from_conn_string(db_path) as checkpointer:
         run_session("resnet18", registered_hw_config, "thread-calib-default", checkpointer)
 
-    assert "[calibration] uncalibrated" in capsys.readouterr().out
+    assert "[calibration] approximate" in capsys.readouterr().out
 
 
-def test_run_session_with_allow_approximate_calibration_prints_approximate_status(capsys, tmp_path, registered_hw_config):
+def test_run_session_with_exact_calibration_only_prints_uncalibrated_status(capsys, tmp_path, registered_hw_config):
     db_path = str(tmp_path / "checkpoints.sqlite")
     with SqliteSaver.from_conn_string(db_path) as checkpointer:
         run_session(
             "resnet18",
             registered_hw_config,
-            "thread-calib-approx",
+            "thread-calib-strict",
             checkpointer,
-            allow_approximate_calibration=True,
+            allow_approximate_calibration=False,
         )
 
-    assert "[calibration] approximate" in capsys.readouterr().out
+    assert "[calibration] uncalibrated" in capsys.readouterr().out
 
 
 # --- .env/.env.local auto-loading ---------------------------------------------
