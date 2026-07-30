@@ -3,16 +3,34 @@
 `stub_planner_llm` (tests/conftest.py) is autouse, so every test here already
 runs against `FakeToolCallingChatModel` -- no test in this suite makes a real
 API call. These tests cover: the tool-calling contract itself (forced
-tool_choice, decision consumed into `planned_layer_configs`), the
-LLM-failure fallback path, and that @tuner actually consumes @planner's
-proposal instead of its own hardcoded baseline.
+tool_choice, rationale/rationale_ko/anomaly_note consumed from the LLM's
+decision -- never layer_configs, which the search alone decides), the
+LLM-failure fallback path, and that @tuner actually consumes
+`planned_layer_configs` instead of its own hardcoded baseline.
 """
 
 import pytest
 
 import nodes.planner as planner_module
-from nodes.planner import _TOOL_NAME, planner_node
+from nodes.planner import _SYSTEM_PROMPT, _TOOL_NAME, planner_node
 from nodes.tuner import tuner_node
+from schemas.planner import PlannerLayerDecision
+
+
+def test_system_prompt_forbids_the_llm_from_proposing_its_own_numbers():
+    """Regression test for a real production failure mode: a local LLM
+    (qwen2.5:7b) read "accuracy below target" in recent_failure_history and
+    reduced weight_bits "to ensure better performance" -- backwards, since
+    less precision generally makes accuracy worse, not better, and silently
+    produced a worse candidate than the search's own suggestion. Rather than
+    trying to teach a small local model the correct direction for every
+    failure type (fragile -- there's always another wrong direction it could
+    guess), the fix removes its ability to propose numbers at all: this
+    asserts the prompt tells it not to, and that PlannerLayerDecision (the
+    forced tool schema) has no field for it to do so through even if it
+    tried."""
+    assert "do not choose or adjust weight_bits" in _SYSTEM_PROMPT.lower()
+    assert "layer_configs" not in PlannerLayerDecision.model_fields
 
 
 def test_planner_forces_tool_choice_to_decision_schema(state_factory, fake_planner_chat_model):
@@ -24,15 +42,19 @@ def test_planner_forces_tool_choice_to_decision_schema(state_factory, fake_plann
     assert fake_planner_chat_model.bind_tools_calls[-1]["tool_choice"] == _TOOL_NAME
 
 
-def test_planner_stores_llm_tool_call_result_in_planned_layer_configs(state_factory):
+def test_planner_stores_search_output_in_planned_layer_configs_ignoring_llm_numbers(state_factory):
+    """planned_layer_configs must come from the search (stage_configs),
+    never from the LLM's tool call -- PlannerLayerDecision has no
+    layer_configs field to propose numbers through even if a real model
+    tried (nodes/planner.py's module docstring)."""
     state = state_factory()
+    stage_names = planner_module.real_stage_names(state["model_id"])
+    stage_points, _ = planner_module._propose_stage_points(state, stage_names)
+    expected_layer_configs = planner_module.points_to_stage_configs(stage_points, stage_names)
 
     update = planner_node(state)
 
-    assert update["planned_layer_configs"] == [
-        {"layer_name": "conv", "weight_bits": 6, "activation_bits": 6, "column_pruning_ratio": 0.1},
-        {"layer_name": "fc", "weight_bits": 4, "activation_bits": 4, "column_pruning_ratio": 0.2},
-    ]
+    assert update["planned_layer_configs"] == [lc.model_dump(mode="json") for lc in expected_layer_configs]
     assert any("fake planner decision for testing" in m["content"] for m in update["messages"])
 
 
@@ -157,36 +179,51 @@ def test_planner_falls_back_when_llm_returns_no_matching_tool_call(monkeypatch, 
 
 
 def test_tuner_consumes_planner_planned_layer_configs_instead_of_its_own_default(state_factory, registered_hw_config):
-    state = state_factory(hw_spec_id=registered_hw_config.hw_spec_id)
-    planner_update = planner_node(state)
-    state = {**state, **planner_update}
+    """planned_layer_configs is set directly (bypassing planner_node/the
+    search entirely) -- this test's job is @tuner actually reading it, not
+    what @planner's search happens to produce for a given seed."""
+    state = state_factory(
+        hw_spec_id=registered_hw_config.hw_spec_id,
+        planned_layer_configs=[
+            {"layer_name": "conv", "weight_bits": 6, "activation_bits": 6, "column_pruning_ratio": 0.1},
+            {"layer_name": "fc", "weight_bits": 4, "activation_bits": 4, "column_pruning_ratio": 0.2},
+        ],
+    )
 
     tuner_result = tuner_node(state)["metrics_store"]["tuner"]
 
     assert tuner_result["status"] == "SUCCESS"
-    # averaged across the fake's two per-stage entries: (6+4)/2, (0.1+0.2)/2
+    # averaged across the two per-stage entries: (6+4)/2, (0.1+0.2)/2
     assert tuner_result["data"]["avg_weight_bits"] == 5.0
     assert tuner_result["data"]["avg_column_pruning_ratio"] == pytest.approx(0.15)
 
 
 def test_tuner_applies_different_quantization_to_different_real_stages(state_factory, registered_hw_config):
     """End-to-end proof that per-layer granularity actually reaches the
-    model, not just `layer_configs`' own data: @planner's two distinct
-    per-stage proposals ("conv" -> 6 bits, "fc" -> 4 bits, from
-    FakeToolCallingChatModel's default) must land as genuinely different
-    quantization grids on the fake backend's two real submodules."""
+    model, not just `layer_configs`' own data: two deliberately distinct
+    per-stage configs ("conv" -> 6 bits, "fc" -> 4 bits, set directly --
+    the search's own real output isn't guaranteed to differ per stage for
+    every seed/hw combination, so this isolates @tuner's per-stage
+    application from the search's variance) must land as genuinely
+    different quantization grids on the fake backend's two real
+    submodules."""
     import torch
 
     from tests.conftest import make_fake_qat_backend
     from tools.qat import apply_crossbar_quant_prune
 
-    state = state_factory(hw_spec_id=registered_hw_config.hw_spec_id)
-    state = {**state, **planner_node(state)}
+    state = state_factory(
+        hw_spec_id=registered_hw_config.hw_spec_id,
+        planned_layer_configs=[
+            {"layer_name": "conv", "weight_bits": 6, "activation_bits": 6, "column_pruning_ratio": 0.1},
+            {"layer_name": "fc", "weight_bits": 4, "activation_bits": 4, "column_pruning_ratio": 0.2},
+        ],
+    )
 
     stage_configs = {
         lc["layer_name"]: (lc["weight_bits"], lc["column_pruning_ratio"]) for lc in state["planned_layer_configs"]
     }
-    assert stage_configs["conv"][0] != stage_configs["fc"][0]  # sanity: the fake really proposed different bits
+    assert stage_configs["conv"][0] != stage_configs["fc"][0]  # sanity: deliberately distinct bits
 
     backend = make_fake_qat_backend()
     apply_crossbar_quant_prune(backend.base_model, stage_configs, default_config=(8, 0.0))
