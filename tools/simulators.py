@@ -32,6 +32,8 @@ from middleware import wrap_tool_call
 from schemas.tools import (
     MapperToolInput,
     MapperToolOutput,
+    PrecisionCheckToolInput,
+    PrecisionCheckToolOutput,
     ProfilerToolInput,
     ProfilerToolOutput,
     SearchPaperResult,
@@ -44,7 +46,9 @@ from schemas.tools import (
     VerifierToolOutput,
 )
 from tools.cim_physics import simulate_cim_profile, simulate_noc_mapping
+from tools.precision_check import compute_updated_calibration_factor, simulate_precise_energy
 from tools.qat import get_qat_backend, run_qat_tuning
+from tools.targets import check_targets
 
 
 @wrap_tool_call(TunerToolInput, node_name="tuner")
@@ -70,6 +74,12 @@ def tuner_tool(args: TunerToolInput) -> TunerToolOutput:
         default_config=(round(avg_weight_bits), avg_pruning_ratio),
         max_epochs=args.max_epochs,
         early_stopping_patience=args.early_stopping_patience,
+        # Column-wise partial-sum quantization (tools/qat.py's
+        # apply_crossbar_quant_prune/_PartialSumQuant): a fixed hardware
+        # property (one ADC per crossbar, same precision for every
+        # column), not a per-stage search parameter -- args.hw_config,
+        # not args.layer_configs.
+        adc_bits=args.hw_config.adc_bits,
     )
 
     return TunerToolOutput(
@@ -161,6 +171,44 @@ def verifier_tool(args: VerifierToolInput) -> VerifierToolOutput:
             "is_converged": is_converged,
             "noc_latency_ms": mapper_data.get("noc_latency_ms"),
             "energy_pj": profiler_data.get("energy_pj"),
+        },
+    )
+
+
+@wrap_tool_call(PrecisionCheckToolInput, node_name="precision_check")
+def precision_check_tool(args: PrecisionCheckToolInput) -> PrecisionCheckToolOutput:
+    """MOCK Stage-2 high-fidelity re-verification (tools/precision_check.py,
+    CLAUDE.md 5.D Mock First) -- only called for a candidate @evaluator's
+    fast-approximation already judged converged (nodes/precision_verifier.py),
+    never every candidate a run searches: a real NeuroSim/CIM-Loop call is
+    far more expensive than tools/cim_physics.py's analytical formulas, so
+    this re-checks only the (rare) candidates a run is about to stop on.
+
+    Re-runs `check_targets` (tools/targets.py, the same rule @evaluator
+    itself uses) with the precise energy number in place of the fast one --
+    accuracy/noc_latency_ms are passed through unchanged (analog crossbar/
+    ADC fidelity is this check's scope, not @tuner's measured accuracy or
+    @mapper's NoC routing time)."""
+    result = simulate_precise_energy(args.hw_config, args.layer_configs)
+    calibration_factor = compute_updated_calibration_factor(result["raw_energy_pj"], result["precise_energy_pj"])
+
+    target_errors = check_targets(
+        args.accuracy,
+        result["precise_energy_pj"],
+        args.noc_latency_ms,
+        args.target_accuracy,
+        args.target_energy_pj,
+        args.target_latency_ms,
+    )
+
+    return PrecisionCheckToolOutput(
+        status=ToolStatus.SUCCESS,
+        data={
+            "raw_energy_pj": round(result["raw_energy_pj"], 6),
+            "precise_energy_pj": round(result["precise_energy_pj"], 6),
+            "calibration_factor": round(calibration_factor, 6),
+            "is_converged": not target_errors,
+            "target_errors": target_errors,
         },
     )
 
