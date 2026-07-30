@@ -7,7 +7,22 @@ START -> planner -> tuner -> (mapper, profiler fan-out) -> verifier -> evaluator
                        hitl_human_approval <--- HITL Interrupt ------------+
                             |                                              |
                             +----------------------> planner               |
-                                                                            +--> Converged (Done) -> END
+                                                                            +--> Converged (Done) -> precision_verifier
+                                                                                                            |
+                                                    +-------------- Re-plan with History -------------------+
+                                                    |                                                       |
+                                               hitl_human_approval <--- HITL Interrupt ---------------------+
+                                                    |                                                       |
+                                                    +-> planner                                             +--> Converged (Done) -> END
+
+@precision_verifier (mock Stage-2 high-fidelity re-check, CLAUDE.md 5.D Mock
+First) sits between @evaluator's fast-approximation convergence call and a
+real `END` -- @evaluator's own "Converged (Done)" routes here first instead
+of straight to `END`, and this node re-routes through the exact same three
+outcomes @evaluator_router already defines (reused directly, not
+duplicated) once its own precision check confirms (or overturns) that
+verdict. Only a candidate the fast approximation already thinks is done
+ever reaches this node -- never every candidate a search tries.
 
 HITL pausing uses only the dynamic `interrupt()` call inside `hitl_node`
 (checklist item 1 / CLAUDE.md 5.B) -- `workflow.compile()` below must never
@@ -27,6 +42,7 @@ from nodes import (
     hitl_node,
     mapper_node,
     planner_node,
+    precision_verifier_node,
     profiler_node,
     tuner_node,
     verifier_node,
@@ -43,6 +59,7 @@ def build_graph(checkpointer: Optional[BaseCheckpointSaver] = None) -> CompiledS
     workflow.add_node("profiler", profiler_node)
     workflow.add_node("verifier", verifier_node)
     workflow.add_node("evaluator", evaluator_node)
+    workflow.add_node("precision_verifier", precision_verifier_node)
     workflow.add_node("hitl_human_approval", hitl_node)
 
     workflow.add_edge(START, "planner")
@@ -60,6 +77,19 @@ def build_graph(checkpointer: Optional[BaseCheckpointSaver] = None) -> CompiledS
     workflow.add_conditional_edges(
         "evaluator",
         evaluator_router,
+        {
+            # Was END directly before @precision_verifier existed -- the
+            # fast-approximation's own "converged" verdict is no longer
+            # final by itself, only a trigger for the (rare, expensive)
+            # precise re-check.
+            "Converged (Done)": "precision_verifier",
+            "HITL Interrupt": "hitl_human_approval",
+            "Re-plan with History": "planner",
+        },
+    )
+    workflow.add_conditional_edges(
+        "precision_verifier",
+        evaluator_router,  # same three outcomes, same state fields -- see module docstring
         {
             "Converged (Done)": END,
             "HITL Interrupt": "hitl_human_approval",
