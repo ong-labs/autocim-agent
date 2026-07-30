@@ -122,6 +122,40 @@ class VerifierToolOutput(ToolResult):
     )
 
 
+# --- @precision_verifier: mock Stage-2 high-fidelity re-check --------------
+#
+# CLAUDE.md 5.D Mock First: tools/precision_check.py's computation is a
+# clearly-labeled placeholder, not a real NeuroSim/CIM-Loop call -- this
+# schema is the real interface that call will eventually fill, defined now
+# so the graph routing/state-flow around it (nodes/precision_verifier.py,
+# graph.py) can be built and tested first.
+
+
+class PrecisionCheckToolInput(BaseModel):
+    execution_context: ExecutionContext
+    hw_config: HWConfig
+    layer_configs: List[LayerBitConfig] = Field(
+        ..., min_length=1, description="The exact config this candidate was evaluated with"
+    )
+    accuracy: Optional[float] = Field(default=None, description="@tuner's measured accuracy -- re-verification doesn't touch this")
+    noc_latency_ms: Optional[float] = Field(
+        default=None, description="@mapper's NoC latency -- re-verification doesn't touch this (out of scope: analog crossbar/ADC fidelity, not NoC routing)"
+    )
+    target_accuracy: Optional[float] = None
+    target_energy_pj: Optional[float] = None
+    target_latency_ms: Optional[float] = None
+
+
+class PrecisionCheckToolOutput(ToolResult):
+    data: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "e.g. {'raw_energy_pj': float, 'precise_energy_pj': float, 'calibration_factor': float, "
+            "'is_converged': bool, 'target_errors': list[str]}"
+        ),
+    )
+
+
 # --- @search_paper: external literature search tool -------------------------
 
 
