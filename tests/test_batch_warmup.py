@@ -16,7 +16,7 @@ from tools.search import compute_pareto_rank
 
 
 def test_run_parallel_warmup_evaluates_every_warmup_candidate(good_hw_config):
-    candidate_history, failure_history = run_parallel_warmup("resnet18", good_hw_config)
+    candidate_history, failure_history, _ = run_parallel_warmup("resnet18", good_hw_config)
 
     n_stages = len(real_stage_names("resnet18"))
     expected_n = warmup_count(n_stages)
@@ -24,7 +24,7 @@ def test_run_parallel_warmup_evaluates_every_warmup_candidate(good_hw_config):
 
 
 def test_run_parallel_warmup_records_valid_multi_objective_data(good_hw_config):
-    candidate_history, failure_history = run_parallel_warmup("resnet18", good_hw_config)
+    candidate_history, failure_history, _ = run_parallel_warmup("resnet18", good_hw_config)
 
     assert failure_history == []  # good_hw_config converges -> no reason for any candidate to fail validation
     for entry in candidate_history:
@@ -40,7 +40,7 @@ def test_run_parallel_warmup_pareto_ranks_match_sequential_recomputation(good_hw
     exactly what compute_pareto_rank would produce processing the same
     candidates one at a time in warm-up-index order -- proving the
     parallel execution didn't introduce order-dependent races."""
-    candidate_history, _ = run_parallel_warmup("resnet18", good_hw_config)
+    candidate_history, _, _ = run_parallel_warmup("resnet18", good_hw_config)
 
     recomputed_history = []
     for entry in candidate_history:
@@ -57,7 +57,7 @@ def test_run_parallel_warmup_still_records_non_converging_candidates(registered_
     establishes this for the sequential path), so it belongs in
     candidate_history with is_converged=False, not failure_history --
     failure_history is only for incomplete/schema-invalid results."""
-    candidate_history, failure_history = run_parallel_warmup("resnet18", registered_bad_hw_config)
+    candidate_history, failure_history, _ = run_parallel_warmup("resnet18", registered_bad_hw_config)
 
     n_stages = len(real_stage_names("resnet18"))
     assert len(candidate_history) == warmup_count(n_stages)
@@ -70,13 +70,47 @@ def test_run_parallel_warmup_honors_calibration_factors(good_hw_config):
     """calibration_factors must actually reach @profiler's calculation, not
     be silently dropped for the parallel path -- otherwise warm-up energy
     figures would be uncalibrated even when the sequential path's would be."""
-    uncalibrated, _ = run_parallel_warmup("resnet18", good_hw_config)
-    calibrated, _ = run_parallel_warmup("resnet18", good_hw_config, calibration_factors={good_hw_config.hw_spec_id: 2.0})
+    uncalibrated, _, _ = run_parallel_warmup("resnet18", good_hw_config)
+    calibrated, _, _ = run_parallel_warmup("resnet18", good_hw_config, calibration_factors={good_hw_config.hw_spec_id: 2.0})
 
     # Same candidates (deterministic seed) -> same layer_configs -> the only
     # difference should be the calibration multiplier applied to energy_pj.
     for u, c in zip(sorted(uncalibrated, key=lambda e: e["iteration"]), sorted(calibrated, key=lambda e: e["iteration"])):
         assert c["energy_pj"] == u["energy_pj"] * 2.0
+
+
+def test_run_parallel_warmup_planner_decisions_match_candidate_iterations(good_hw_config):
+    """tools/dashboard.py joins candidate_history against planner_decisions
+    by iteration number (_iteration_rows) -- these entries must cover every
+    candidate_history iteration with the same "LHS warm-up candidate i/n"
+    tag nodes/planner.py's own sequential warm-up path produces, or the
+    dashboard's search phase/rationale columns render blank for warm-up
+    rows."""
+    candidate_history, _, planner_decisions = run_parallel_warmup("resnet18", good_hw_config)
+
+    n_stages = len(real_stage_names("resnet18"))
+    n_warmup = warmup_count(n_stages)
+    assert {d["iteration"] for d in planner_decisions} == {c["iteration"] for c in candidate_history}
+    for decision in planner_decisions:
+        assert decision["search_tag"] == f"LHS warm-up candidate {decision['iteration']}/{n_warmup}"
+        assert decision["used_llm"] is False
+        assert decision["rationale"]
+        assert decision["rationale_ko"]
+
+
+def test_run_parallel_warmup_reports_progress_as_each_candidate_completes(good_hw_config):
+    """on_progress must fire once per candidate (not once total, not zero
+    times) -- this batch can otherwise run for minutes with no output at
+    all, easy to mistake for a hang (main.py's caller prints from this)."""
+    n_stages = len(real_stage_names("resnet18"))
+    expected_n = warmup_count(n_stages)
+
+    progress_calls = []
+    run_parallel_warmup("resnet18", good_hw_config, on_progress=lambda done, total: progress_calls.append((done, total)))
+
+    assert len(progress_calls) == expected_n
+    assert all(total == expected_n for _, total in progress_calls)
+    assert sorted(done for done, _ in progress_calls) == list(range(1, expected_n + 1))
 
 
 def test_run_parallel_warmup_is_actually_concurrent(good_hw_config, monkeypatch):
