@@ -1,6 +1,6 @@
 # AutoCIM-Agent
 
-**CIM(Compute-In-Memory) 반도체를 위한 LangGraph 기반 6-에이전트 HW-SW 공동설계 최적화 프레임워크**
+**CIM(Compute-In-Memory) 반도체를 위한 LangGraph 기반 7-에이전트 HW-SW 공동설계 최적화 프레임워크**
 
 레이어별 양자화 비트/컬럼 프루닝 비율과 크로스바 하드웨어 제약(ADC/DAC 해상도, IR-drop, 소자 노이즈)을 함께 고려해, 정확도·에너지·지연시간의 Pareto 최적점을 자율적으로 탐색하는 폐루프(closed-loop) 에이전트 파이프라인입니다. 배경과 전체 설계 의도는 [`docs/research_plan.md`](docs/research_plan.md)를, 코드 작성 규칙은 [`CLAUDE.md`](CLAUDE.md)를 참고하세요.
 
@@ -232,7 +232,7 @@ pip install --force-reinstall --no-deps torch==2.13.0 torchvision==0.28.0 --inde
 ```
 graph.py, main.py, state.py, llm.py, middleware.py,
 observability.py, store.py   # 코어 오케스트레이션/런타임 (LangGraph 조립, 상태 스키마, LLM 운영, 구조화 로깅)
-nodes/                        # 6개 에이전트 노드 함수
+nodes/                        # 7개 에이전트 노드 함수
 tools/                        # 백엔드 시뮬레이터 (QAT, 물리 시뮬레이션, 탐색 알고리즘, 병렬 워밍업, 대시보드)
 schemas/                      # Pydantic 입출력 스키마
 tests/                        # pytest 스위트 (전부 stub 기반)
